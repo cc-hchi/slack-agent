@@ -342,7 +342,7 @@ func (s *Store) DashboardSnapshot() (DashboardSnapshot, error) {
 	replyDrafts, err := s.queryMaps(`
 		SELECT rd.*, j.title AS job_title, j.status AS job_status,
 		       st.title AS thread_title, st.channel_name, st.channel_id, st.source_type,
-		       st.permalink, st.last_slack_activity_at,
+		       st.thread_ts, st.permalink, st.last_slack_activity_at,
 		       ar.confidence, ar.summary AS analyzer_summary, ar.rationale AS analyzer_rationale,
 		       (
 		         SELECT COALESCE(
@@ -382,7 +382,7 @@ func (s *Store) DashboardSnapshot() (DashboardSnapshot, error) {
 	}
 	blocked, err := s.queryMaps(`
 		SELECT 'job' AS item_type, j.*, st.channel_name, st.channel_id, st.source_type,
-		       st.permalink, st.title AS thread_title, st.last_slack_activity_at,
+		       st.thread_ts, st.permalink, st.title AS thread_title, st.last_slack_activity_at,
 		       (
 		         SELECT COALESCE(
 		           NULLIF(CASE WHEN LENGTH(TRIM(COALESCE(su.display_name, ''))) > 1 THEN su.display_name ELSE '' END, ''),
@@ -419,7 +419,7 @@ func (s *Store) DashboardSnapshot() (DashboardSnapshot, error) {
 	}
 	analysisFailures, err := s.queryMaps(`
 			SELECT 'thread' AS item_type, st.id, st.id AS slack_thread_id, st.title,
-			       st.status, st.channel_name, st.channel_id, st.source_type, st.permalink,
+			       st.status, st.channel_name, st.channel_id, st.thread_ts, st.source_type, st.permalink,
 			       st.last_synced_at AS updated_at,
 			       COALESCE(ar.error, 'Analyzer failed') AS current_block_reason,
 			       'Retry analysis after reviewing the analyzer failure.' AS next_user_action,
@@ -464,7 +464,7 @@ func (s *Store) DashboardSnapshot() (DashboardSnapshot, error) {
 	}
 	blocked = append(blocked, analysisFailures...)
 	queued, err := s.queryMaps(`
-			SELECT j.*, st.channel_name, st.channel_id, st.source_type, st.permalink,
+			SELECT j.*, st.channel_name, st.channel_id, st.thread_ts, st.source_type, st.permalink,
 			       st.title AS thread_title, st.last_slack_activity_at,
 			       (
 			         SELECT COALESCE(
@@ -626,7 +626,7 @@ func (s *Store) DashboardSnapshot() (DashboardSnapshot, error) {
 		return DashboardSnapshot{}, err
 	}
 	jobs, err := s.queryMaps(`
-			SELECT j.*, st.channel_name, st.channel_id, st.source_type, st.permalink,
+			SELECT j.*, st.channel_name, st.channel_id, st.thread_ts, st.source_type, st.permalink,
 			       st.title AS thread_title, st.last_slack_activity_at,
 			       (
 			         SELECT COALESCE(
@@ -759,7 +759,7 @@ func (s *Store) jobsByIDs(ids []int64) ([]map[string]any, error) {
 	}
 	return s.queryMaps(`
 		SELECT j.*, st.channel_name, st.channel_id, st.source_type, st.permalink,
-		       st.title AS thread_title, st.last_slack_activity_at,
+		       st.thread_ts, st.title AS thread_title, st.last_slack_activity_at,
 		       (
 		         SELECT COALESCE(
 		           NULLIF(CASE WHEN LENGTH(TRIM(COALESCE(su.display_name, ''))) > 1 THEN su.display_name ELSE '' END, ''),

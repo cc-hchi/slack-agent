@@ -42,6 +42,7 @@ Slack source rules:
 
 Responsibilities:
 
+- Create a dedicated Slack-thread workspace and run workspace bootstrap.
 - Start a dedicated Codex thread for one Slack thread snapshot.
 - Ask Codex whether the Slack context requires user action.
 - Require structured output:
@@ -56,26 +57,29 @@ Responsibilities:
 - Create a job when action is needed.
 - Record "no action" decisions with rationale.
 
-Analyzer sessions should be isolated from worker sessions. They answer "should
-we act?" and produce a job plan, but do not do the work.
+Analyzer sessions should be isolated from worker sessions, but they share the
+same Slack-thread workspace so worker execution can reuse analyzer context and
+artifacts. They answer "should we act?" and produce a job plan, but do not do
+the work.
 
 ### Job Orchestrator
 
 Responsibilities:
 
 - Own job state transitions.
-- Create per-job workspace folders.
-- Run workspace bootstrap.
+- Reuse the Slack-thread workspace created by the analyzer.
+- Create and bootstrap a fallback workspace for legacy or manually-created jobs.
 - Start worker sessions.
 - Retry failed or blocked jobs only when explicitly requested.
 - Enforce the Slack send gate.
 
 Workspace initialization:
 
-1. Create job workspace directory.
-2. Run configurable bootstrap command. Default:
+1. Use the job's persisted `workspace_path` when present.
+2. Otherwise derive the workspace from the Slack thread id.
+3. If no bootstrapped workspace exists, run the configurable bootstrap command.
+   Default:
    `install-chi-skills`
-3. Record stdout, stderr, exit code, and duration.
 4. Continue only if bootstrap succeeds, unless the user manually overrides.
 
 ### Codex Worker

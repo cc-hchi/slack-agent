@@ -360,20 +360,23 @@ button:disabled {
 }
 
 .draft-table {
-  grid-template-columns: 76px minmax(150px, 1.4fr) minmax(110px, 0.85fr) 104px 105px 74px;
-  column-gap: 10px;
+  grid-template-columns: 58px minmax(0, 1.35fr) minmax(0, 0.85fr) 88px 82px 62px 30px;
+  column-gap: 9px;
 }
 
 .blocked-table {
-  grid-template-columns: minmax(190px, 1.25fr) minmax(150px, 0.85fr) minmax(230px, 1fr) 56px;
+  grid-template-columns: minmax(0, 1.25fr) minmax(94px, 0.85fr) minmax(0, 1fr) 48px 30px;
+  column-gap: 10px;
 }
 
 .worker-table {
-  grid-template-columns: 104px minmax(190px, 1.2fr) minmax(200px, 1fr) 120px 100px;
+  grid-template-columns: 82px minmax(0, 1.2fr) minmax(0, 1fr) 86px 74px 30px;
+  column-gap: 10px;
 }
 
 .intake-table {
-  grid-template-columns: 130px minmax(260px, 1.5fr) minmax(140px, 0.9fr) 128px 72px;
+  grid-template-columns: 92px minmax(0, 1.5fr) minmax(0, 0.9fr) 96px 60px 30px;
+  column-gap: 10px;
 }
 
 .health-table {
@@ -397,6 +400,11 @@ button:disabled {
 .row:hover,
 .row.selected {
   background: #f2f7ff;
+}
+
+.row:focus-visible {
+  outline: 2px solid #c9def8;
+  outline-offset: -2px;
 }
 
 .row.static-row {
@@ -445,6 +453,37 @@ button:disabled {
 .worker-table.row > span:nth-child(4),
 .worker-table.row > span:nth-child(5) {
   white-space: nowrap;
+}
+
+.slack-link-button {
+  display: inline-grid;
+  place-items: center;
+  justify-self: end;
+  width: 30px;
+  height: 30px;
+  border: 1px solid #d9dee6;
+  border-radius: 7px;
+  background: #fff;
+  color: #435268;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.slack-link-button:hover {
+  border-color: #b9d1ee;
+  background: #edf5ff;
+  color: #195cb2;
+}
+
+.slack-link-button:focus-visible {
+  outline: 2px solid #b9d1ee;
+  outline-offset: 2px;
+}
+
+.slack-link-button.disabled {
+  color: #a4afbd;
+  cursor: not-allowed;
+  opacity: 0.7;
 }
 
 .priority {

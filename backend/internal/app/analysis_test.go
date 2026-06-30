@@ -8,7 +8,7 @@ import (
 )
 
 func TestAnalysisPromptRequiresChineseUserFacingStrings(t *testing.T) {
-	prompt := analysisPrompt(map[string]any{"title": "Need help"}, nil)
+	prompt := analysisPrompt(map[string]any{"title": "Need help"}, nil, nil)
 
 	for _, want := range []string{
 		`"task_title": "简短中文工作项标题"`,
@@ -17,6 +17,41 @@ func TestAnalysisPromptRequiresChineseUserFacingStrings(t *testing.T) {
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("analysis prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestAnalysisPromptRequiresSlackContextRouting(t *testing.T) {
+	prompt := analysisPrompt(map[string]any{"title": "Need help", "source_type": "dm"}, nil, nil)
+
+	for _, want := range []string{
+		"trigger event",
+		"Slack context skill",
+		"nearby messages in the same DM",
+		"Related jobs from the same Slack DM/channel",
+		"at most 20 jobs",
+		"existing/running job",
+		"my own Slack reply",
+		"action_required=false when this trigger is only additional context",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("analysis prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestWorkerPromptRequiresSlackContextRefresh(t *testing.T) {
+	prompt := workerPrompt(map[string]any{"title": "Need help"}, nil)
+
+	for _, want := range []string{
+		"refresh the latest relevant Slack context",
+		"nearby messages in the same DM",
+		"already handled by another active job",
+		"my own Slack reply after the latest relevant external message",
+		"Before drafting a Slack reply, check again",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("worker prompt missing %q:\n%s", want, prompt)
 		}
 	}
 }

@@ -85,6 +85,7 @@ export function App() {
 
   const counts = snapshot?.counts ?? {};
   const health = snapshot?.health ?? [];
+  const replyDrafts = useMemo(() => sortBySlackActivity(snapshot?.reply_drafts), [snapshot?.reply_drafts]);
   const selectSection = (section) => {
     setActiveSection(section);
     const nextSelection = pickSectionSelection(snapshot, section);
@@ -165,22 +166,23 @@ export function App() {
 
         {activeSection === "review" && (
         <section className="queue-section active-view" id="section-review">
-          <SectionTitle title="Reply drafts ready for review" count={snapshot?.reply_drafts?.length ?? 0} />
+          <SectionTitle title="Reply drafts ready for review" count={replyDrafts.length} />
           <div className="table-shell">
             <div className="draft-table header">
               <span>Priority</span>
               <span>Job</span>
-                <span>From</span>
+              <span>From</span>
               <span>Analyzer</span>
               <span>Confidence</span>
-              <span>Updated</span>
+              <span>Activity</span>
+              <span>Slack</span>
             </div>
-            {(snapshot?.reply_drafts ?? []).map((draft) => (
-              <button
+            {replyDrafts.map((draft) => (
+              <SelectableRow
                 key={draft.id}
-                className={`draft-table row ${selected?.type === "reply" && selected?.id === draft.id ? "selected" : ""}`}
-                type="button"
-                onClick={() => setSelected({ type: "reply", id: draft.id })}
+                className="draft-table row"
+                selected={selected?.type === "reply" && selected?.id === draft.id}
+                onSelect={() => setSelected({ type: "reply", id: draft.id })}
               >
                 <Priority value="high" />
                 <span>
@@ -198,10 +200,13 @@ export function App() {
                   {hasConfidence(draft.confidence) && <Progress value={Number(draft.confidence)} />}
                   {formatConfidence(draft.confidence)}
                 </span>
-                <span>{timeOnly(draft.updated_at)}</span>
-              </button>
+                <span title={dateTimeFull(draft.last_slack_activity_at)}>
+                  {displayActivityTime(draft.last_slack_activity_at)}
+                </span>
+                <SlackLinkButton item={draft} />
+              </SelectableRow>
             ))}
-            {snapshot && snapshot.reply_drafts?.length === 0 && <EmptyRow text="No reply drafts waiting." />}
+            {snapshot && replyDrafts.length === 0 && <EmptyRow text="No reply drafts waiting." />}
           </div>
         </section>
         )}
@@ -216,13 +221,14 @@ export function App() {
               <span>Channel</span>
               <span>Status</span>
               <span>Activity</span>
+              <span>Slack</span>
             </div>
             {(snapshot?.intake ?? []).map((thread) => (
-              <button
+              <SelectableRow
                 key={thread.id}
-                className={`intake-table row ${selected?.type === "thread" && selected?.id === thread.id ? "selected" : ""}`}
-                type="button"
-                onClick={() => setSelected({ type: "thread", id: thread.id })}
+                className="intake-table row"
+                selected={selected?.type === "thread" && selected?.id === thread.id}
+                onSelect={() => setSelected({ type: "thread", id: thread.id })}
               >
                 <span>
                   <strong>{actorName(thread)}</strong>
@@ -242,7 +248,8 @@ export function App() {
                   </StateBadge>
                 </span>
                 <span title={dateTimeFull(thread.last_slack_activity_at)}>{activityTime(thread.last_slack_activity_at)}</span>
-              </button>
+                <SlackLinkButton item={thread} />
+              </SelectableRow>
             ))}
             {snapshot && snapshot.intake?.length === 0 && <EmptyRow text="No Slack intake waiting." />}
           </div>
@@ -258,13 +265,14 @@ export function App() {
               <span>From</span>
               <span>Reason</span>
               <span>Age</span>
+              <span>Slack</span>
             </div>
             {(snapshot?.blocked ?? []).map((job) => (
-              <button
+              <SelectableRow
                 key={`${job.item_type || "job"}-${job.id}`}
-                className={`blocked-table row ${isSelectedBlocked(selected, job) ? "selected" : ""}`}
-                type="button"
-                onClick={() => setSelected(blockedSelection(job))}
+                className="blocked-table row"
+                selected={isSelectedBlocked(selected, job)}
+                onSelect={() => setSelected(blockedSelection(job))}
               >
                 <span>
                   <strong>{job.title}</strong>
@@ -276,7 +284,8 @@ export function App() {
                 </span>
                 <span>{job.current_block_reason || "Needs user confirmation"}</span>
                 <span className="age">{relativeTime(job.updated_at)}</span>
-              </button>
+                <SlackLinkButton item={job} />
+              </SelectableRow>
             ))}
             {snapshot && snapshot.blocked?.length === 0 && <EmptyRow text="No blocked jobs." />}
           </div>
@@ -293,13 +302,14 @@ export function App() {
               <span>Workspace</span>
               <span>Status</span>
               <span>Age</span>
+              <span>Slack</span>
             </div>
             {(snapshot?.queued ?? []).map((job) => (
-              <button
+              <SelectableRow
                 key={job.id}
-                className={`worker-table row ${selected?.type === "job" && selected?.id === job.id ? "selected" : ""}`}
-                type="button"
-                onClick={() => setSelected({ type: "job", id: job.id })}
+                className="worker-table row"
+                selected={selected?.type === "job" && selected?.id === job.id}
+                onSelect={() => setSelected({ type: "job", id: job.id })}
               >
                 <span className="worker-name">
                   <span className="status-dot" />
@@ -309,7 +319,8 @@ export function App() {
                 <span className="mono">{job.workspace_path || "pending"}</span>
                 <span>{statusLabel(job.status)}</span>
                 <span className="age">{relativeTime(job.updated_at)}</span>
-              </button>
+                <SlackLinkButton item={job} />
+              </SelectableRow>
             ))}
             {snapshot && snapshot.queued?.length === 0 && <EmptyRow text="No jobs queued." />}
           </div>
@@ -326,13 +337,14 @@ export function App() {
               <span>Workspace</span>
               <span>Step</span>
               <span>Progress</span>
+              <span>Slack</span>
             </div>
             {(snapshot?.active ?? []).map((job) => (
-              <button
+              <SelectableRow
                 key={job.id}
-                className={`worker-table row ${selected?.type === "job" && selected?.id === job.id ? "selected" : ""}`}
-                type="button"
-                onClick={() => setSelected({ type: "job", id: job.id })}
+                className="worker-table row"
+                selected={selected?.type === "job" && selected?.id === job.id}
+                onSelect={() => setSelected({ type: "job", id: job.id })}
               >
                 <span className="worker-name">
                   <span className="status-dot good" />
@@ -342,7 +354,8 @@ export function App() {
                 <span className="mono">{job.workspace_path || "pending"}</span>
                 <span>{statusLabel(job.status)}</span>
                 <Progress value={job.status === "working" ? 0.62 : 0.24} />
-              </button>
+                <SlackLinkButton item={job} />
+              </SelectableRow>
             ))}
             {snapshot && snapshot.active?.length === 0 && <EmptyRow text="No workers running right now." />}
           </div>
@@ -359,13 +372,14 @@ export function App() {
               <span>Channel</span>
               <span>Status</span>
               <span>Activity</span>
+              <span>Slack</span>
             </div>
             {(snapshot?.archive ?? []).map((thread) => (
-              <button
+              <SelectableRow
                 key={thread.id}
-                className={`intake-table row ${selected?.type === "thread" && selected?.id === thread.id ? "selected" : ""}`}
-                type="button"
-                onClick={() => setSelected({ type: "thread", id: thread.id })}
+                className="intake-table row"
+                selected={selected?.type === "thread" && selected?.id === thread.id}
+                onSelect={() => setSelected({ type: "thread", id: thread.id })}
               >
                 <span>
                   <strong>{actorName(thread)}</strong>
@@ -383,7 +397,8 @@ export function App() {
                   <StateBadge tone="good">{statusLabel(thread.status)}</StateBadge>
                 </span>
                 <span title={dateTimeFull(thread.last_slack_activity_at)}>{activityTime(thread.last_slack_activity_at)}</span>
-              </button>
+                <SlackLinkButton item={thread} />
+              </SelectableRow>
             ))}
             {snapshot && snapshot.archive?.length === 0 && <EmptyRow text="No archived items yet." />}
           </div>
@@ -489,6 +504,8 @@ export function App() {
 }
 
 function DetailContent({ detail, tab, onAnalyze, onRunJob, busy }) {
+  const slackLink = slackPermalink(detail.thread);
+
   if (tab === "activity") {
     return (
       <section className="detail-card">
@@ -565,8 +582,8 @@ function DetailContent({ detail, tab, onAnalyze, onRunJob, busy }) {
       <section className="detail-card">
         <h4>Slack thread</h4>
         <p className="thread-text">{slackThreadText(detail)}</p>
-        {detail.thread?.permalink && (
-          <a className="external-link" href={detail.thread.permalink}>
+        {slackLink && (
+          <a className="external-link" href={slackLink} target="_blank" rel="noreferrer">
             View in Slack <ExternalLink size={14} />
           </a>
         )}
@@ -745,6 +762,53 @@ function EmptyRow({ text }) {
   return <div className="empty-row">{text}</div>;
 }
 
+function SelectableRow({ className, selected, onSelect, children }) {
+  const handleKeyDown = (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    onSelect();
+  };
+
+  return (
+    <div
+      className={`${className} ${selected ? "selected" : ""}`}
+      role="button"
+      tabIndex={0}
+      onClick={onSelect}
+      onKeyDown={handleKeyDown}
+    >
+      {children}
+    </div>
+  );
+}
+
+function SlackLinkButton({ item }) {
+  const permalink = slackPermalink(item);
+  const label = slackLinkLabel(item);
+  if (!permalink) {
+    return (
+      <span className="slack-link-button disabled" title="Slack link unavailable" aria-label="Slack link unavailable">
+        <ExternalLink size={15} />
+      </span>
+    );
+  }
+
+  return (
+    <a
+      className="slack-link-button"
+      href={permalink}
+      target="_blank"
+      rel="noreferrer"
+      title="Open in Slack"
+      aria-label={`Open ${label} in Slack`}
+      onClick={(event) => event.stopPropagation()}
+      onKeyDown={(event) => event.stopPropagation()}
+    >
+      <ExternalLink size={15} />
+    </a>
+  );
+}
+
 function Priority({ value }) {
   return (
     <span className={`priority ${value}`}>
@@ -825,7 +889,8 @@ function HealthMini({ label, checks, service }) {
 }
 
 function pickInitialSelection(data) {
-  if (data?.reply_drafts?.[0]) return { type: "reply", id: data.reply_drafts[0].id };
+  const replyDraft = firstReplyDraft(data);
+  if (replyDraft) return { type: "reply", id: replyDraft.id };
   if (data?.blocked?.[0]) return blockedSelection(data.blocked[0]);
   if (data?.active?.[0]) return { type: "job", id: data.active[0].id };
   if (data?.queued?.[0]) return { type: "job", id: data.queued[0].id };
@@ -835,7 +900,8 @@ function pickInitialSelection(data) {
 
 function pickSectionSelection(data, section) {
   if (!data) return null;
-  if (section === "review" && data.reply_drafts?.[0]) return { type: "reply", id: data.reply_drafts[0].id };
+  const replyDraft = firstReplyDraft(data);
+  if (section === "review" && replyDraft) return { type: "reply", id: replyDraft.id };
   if (section === "blocked" && data.blocked?.[0]) return blockedSelection(data.blocked[0]);
   if (section === "working" && data.active?.[0]) return { type: "job", id: data.active[0].id };
   if (section === "queue" && data.queued?.[0]) return { type: "job", id: data.queued[0].id };
@@ -846,6 +912,16 @@ function pickSectionSelection(data, section) {
 
 function blockedSelection(item) {
   return { type: item?.item_type === "thread" ? "thread" : "job", id: item.id };
+}
+
+function firstReplyDraft(data) {
+  return sortBySlackActivity(data?.reply_drafts)[0];
+}
+
+function sortBySlackActivity(items = []) {
+  return [...(items ?? [])].sort(
+    (left, right) => dateMillis(right.last_slack_activity_at) - dateMillis(left.last_slack_activity_at),
+  );
 }
 
 function isSelectedBlocked(selected, item) {
@@ -920,6 +996,7 @@ function minimalThreadFromReply(reply) {
     channel_id: reply.channel_id || reply.slack_channel_id,
     channel_name: reply.channel_name,
     source_type: reply.source_type,
+    thread_ts: reply.thread_ts || reply.slack_thread_ts,
     permalink: reply.permalink,
     last_slack_activity_at: reply.last_slack_activity_at,
     root_user_name: reply.root_user_name,
@@ -936,6 +1013,7 @@ function minimalThreadFromJob(job) {
     channel_id: job.channel_id,
     channel_name: job.channel_name,
     source_type: job.source_type,
+    thread_ts: job.thread_ts,
     permalink: job.permalink,
     last_slack_activity_at: job.last_slack_activity_at || job.updated_at,
     root_user_name: job.root_user_name,
@@ -1086,6 +1164,15 @@ function sourceMeta(item) {
   return `${source} / ${channel}`;
 }
 
+function slackPermalink(item) {
+  const value = String(item?.permalink || "").trim();
+  return value || "";
+}
+
+function slackLinkLabel(item) {
+  return item?.thread_title || item?.title || item?.job_title || "Slack item";
+}
+
 function statusLabel(value) {
   return String(value || "pending").replaceAll("_", " ");
 }
@@ -1159,11 +1246,23 @@ function hasConfidence(value) {
   return Number.isFinite(Number(value));
 }
 
+function dateMillis(value) {
+  if (!value) return 0;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 0;
+  return date.getTime();
+}
+
 function timeOnly(value) {
   if (!value) return "now";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value).slice(11, 16) || "now";
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function displayActivityTime(value) {
+  if (!value) return "N/A";
+  return activityTime(value);
 }
 
 function activityTime(value) {

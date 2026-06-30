@@ -65,7 +65,9 @@ Useful automation knobs:
   control thread reply depth.
 - `SLACK_AGENT_SEARCH_LOOKBACK_DAYS=14` keeps an overlap window around sync
   cursors so slower background syncs do not miss late-arriving updates.
-- Codex analyzer and worker threads default to local-only execution:
+- Codex analyzer and worker threads share a per-Slack-thread workspace. The
+  analyzer runs the configured workspace bootstrap before starting; later worker
+  sessions reuse that workspace and default to local-only execution:
   `SLACK_AGENT_CODEX_PERMISSION_PROFILE=:workspace` with
   `SLACK_AGENT_CODEX_APPROVAL_POLICY=never`. This allows local workspace
   file/command work and prevents unattended network or out-of-workspace approval
@@ -78,6 +80,6 @@ Slack sending is only performed through the reply review endpoint:
 
 - The backend uses local SQLite under `data/` by default.
 - Codex workers use `codex app-server` over stdio JSON-RPC.
-- Each job gets a local workspace under `data/workspaces`.
+- Each Slack thread gets a local workspace under `data/workspaces`.
 - The default bootstrap command is `install-chi-skills`; health checks show
   a missing-config state if it is not on `PATH`.

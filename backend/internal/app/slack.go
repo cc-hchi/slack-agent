@@ -84,6 +84,21 @@ func (c *SlackClient) ChatPostMessage(channel, threadTS, text string) (map[strin
 	})
 }
 
+func (c *SlackClient) ChatGetPermalink(channel, messageTS string) (string, error) {
+	payload, err := c.API("chat.getPermalink", url.Values{
+		"channel":    {channel},
+		"message_ts": {messageTS},
+	})
+	if err != nil {
+		return "", err
+	}
+	permalink, _ := payload["permalink"].(string)
+	if permalink == "" {
+		return "", fmt.Errorf("chat.getPermalink returned empty permalink")
+	}
+	return permalink, nil
+}
+
 func (c *SlackClient) SearchMessages(query string, count, page int) ([]map[string]any, SlackSearchPage, error) {
 	payload, err := c.API("search.messages", url.Values{
 		"query":    {query},

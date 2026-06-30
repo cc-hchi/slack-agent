@@ -73,18 +73,19 @@ Slack reply drafts.
 ## Primary Workflow
 
 1. Collector discovers a Slack thread or DM involving the user.
-2. Analyzer opens a dedicated Codex session for that Slack context.
+2. Analyzer creates a dedicated Slack-thread workspace, runs
+   `install-chi-skills`, and opens a dedicated Codex session for that Slack
+   context.
 3. Analyzer decides whether the thread needs user action.
 4. If no action is needed, the system records the reason and archives the item.
-5. If action is needed, the system creates a job.
-6. Worker creates a dedicated workspace folder for that job.
-7. Worker runs the configured workspace bootstrap command, expected to be
-   `install-chi-skills`.
-8. Worker opens a dedicated Codex session and attempts to advance the job.
-9. Worker records progress, artifacts, errors, and final outcome.
-10. If a Slack reply is useful, worker creates a draft.
-11. User reviews, edits, approves, or rejects the draft from the dashboard.
-12. Backend sends the approved reply to Slack.
+5. If action is needed, the system creates a job linked to the analyzer
+   workspace.
+6. Worker reuses the Slack-thread workspace and opens a dedicated Codex session
+   to advance the job.
+7. Worker records progress, artifacts, errors, and final outcome.
+8. If a Slack reply is useful, worker creates a draft.
+9. User reviews, edits, approves, or rejects the draft from the dashboard.
+10. Backend sends the approved reply to Slack.
 
 ## Current Local Probe Results
 

@@ -3,6 +3,7 @@ package app
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -110,6 +111,78 @@ func TestDashboardIntakeIncludesRecollectedThreadWithExistingJob(t *testing.T) {
 	}
 	if len(snapshot.Intake) != 1 {
 		t.Fatalf("expected recollected thread with existing job in intake, got %d", len(snapshot.Intake))
+	}
+}
+
+func TestRelatedJobsForThreadUsesSameChannelMostRecentLimit(t *testing.T) {
+	service, store := testService(t)
+	if _, err := store.db.Exec(`
+		INSERT INTO slack_threads(
+			slack_team_id, channel_id, channel_name, thread_ts, source_type, status,
+			title, last_slack_activity_at
+		) VALUES ('T1', 'D1', 'DM', '1764167000.000100', 'dm', 'collected', 'Trigger', '2026-06-26T10:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	var triggerID int64
+	if err := store.db.QueryRow("SELECT id FROM slack_threads WHERE title='Trigger'").Scan(&triggerID); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 22; i++ {
+		result, err := store.db.Exec(`
+			INSERT INTO slack_threads(
+				slack_team_id, channel_id, channel_name, thread_ts, source_type, status,
+				title, last_slack_activity_at
+			) VALUES ('T1', 'D1', 'DM', ?, 'dm', 'job_created', ?, ?)`,
+			fmt.Sprintf("1764168%03d.000100", i),
+			fmt.Sprintf("Thread %02d", i),
+			fmt.Sprintf("2026-06-26T10:%02d:00Z", i),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		threadID, _ := result.LastInsertId()
+		if _, err := store.db.Exec(
+			"INSERT INTO jobs(slack_thread_id, title, status, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?)",
+			threadID,
+			fmt.Sprintf("same-%02d", i),
+			"2026-06-26T09:00:00Z",
+			fmt.Sprintf("2026-06-26T10:%02d:30Z", i),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := store.db.Exec(`
+		INSERT INTO slack_threads(
+			slack_team_id, channel_id, channel_name, thread_ts, source_type, status,
+			title, last_slack_activity_at
+		) VALUES ('T1', 'D2', 'Other DM', '1764169000.000100', 'dm', 'job_created', 'Other channel', '2026-06-26T11:00:00Z')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherThreadID, _ := result.LastInsertId()
+	if _, err := store.db.Exec(
+		"INSERT INTO jobs(slack_thread_id, title, status, created_at, updated_at) VALUES (?, 'other-channel', 'queued', ?, ?)",
+		otherThreadID,
+		"2026-06-26T11:00:00Z",
+		"2026-06-26T11:00:00Z",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	related := service.relatedJobsForThread(triggerID, 20)
+	if len(related) != 20 {
+		t.Fatalf("expected 20 related jobs, got %d", len(related))
+	}
+	if related[0]["title"] != "same-21" {
+		t.Fatalf("expected newest same-channel job first, got %#v", related[0]["title"])
+	}
+	if related[len(related)-1]["title"] != "same-02" {
+		t.Fatalf("expected limit to keep top 20 same-channel jobs, got last title %#v", related[len(related)-1]["title"])
+	}
+	for _, job := range related {
+		if job["title"] == "other-channel" {
+			t.Fatalf("related jobs should not include other channels: %#v", related)
+		}
 	}
 }
 
@@ -440,6 +513,42 @@ func TestEnsureJobWorkspaceSkipsBootstrapWhenAlreadySucceeded(t *testing.T) {
 	}
 	if eventCount != 1 {
 		t.Fatalf("expected one bootstrap_skipped event, got %d", eventCount)
+	}
+}
+
+func TestJobWorkspaceFallsBackToSlackThreadWorkspace(t *testing.T) {
+	service, _ := testService(t)
+
+	workspace := service.jobWorkspace(7, map[string]any{"slack_thread_id": int64(42)})
+	want := service.threadWorkspace(42)
+	if workspace != want {
+		t.Fatalf("job workspace = %q, want %q", workspace, want)
+	}
+}
+
+func TestJobWorkspacePrefersPersistedWorkspacePath(t *testing.T) {
+	service, _ := testService(t)
+	persisted := filepath.Join(service.cfg.WorkspaceRoot, "custom")
+
+	workspace := service.jobWorkspace(7, map[string]any{
+		"slack_thread_id": int64(42),
+		"workspace_path":  persisted,
+	})
+	if workspace != persisted {
+		t.Fatalf("job workspace = %q, want persisted path %q", workspace, persisted)
+	}
+}
+
+func TestEnsureAnalyzerWorkspaceRunsBootstrap(t *testing.T) {
+	service, _ := testService(t)
+	service.cfg.WorkspaceBootstrapCommand = "touch analyzer_bootstrap_marker"
+	workspace := service.threadWorkspace(1)
+
+	if ok := service.ensureAnalyzerWorkspace(1, 1, workspace); !ok {
+		t.Fatal("expected analyzer workspace setup to succeed")
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "analyzer_bootstrap_marker")); err != nil {
+		t.Fatalf("expected analyzer bootstrap marker, stat err=%v", err)
 	}
 }
 

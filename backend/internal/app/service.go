@@ -343,6 +343,11 @@ func (s *Service) collectThreadFromMessage(client *SlackClient, teamID, fallback
 	if len(messages) > 0 {
 		root = messages[0]
 	}
+	if firstString(root["permalink"]) == "" {
+		if permalink, err := client.ChatGetPermalink(channelID, threadTS); err == nil {
+			root["permalink"] = permalink
+		}
+	}
 	if err := s.upsertThread(teamID, channelID, channelName, threadTS, sourceType, root, messages, userID); err != nil {
 		return threadCollectResult{}, err
 	}
@@ -718,6 +723,7 @@ func (s *Service) upsertThread(teamID, channelID, channelName, threadTS, sourceT
 			source_type=excluded.source_type,
 			status=excluded.status,
 			title=excluded.title,
+			permalink=COALESCE(NULLIF(excluded.permalink, ''), slack_threads.permalink),
 			last_slack_activity_at=excluded.last_slack_activity_at,
 			latest_slack_message_ts=excluded.latest_slack_message_ts,
 			last_synced_at=excluded.last_synced_at,
@@ -1028,9 +1034,8 @@ func (s *Service) runAnalysis(threadID int64) bool {
 		s.finishAnalysisError(threadID, analysisID, err)
 		return false
 	}
-	workspace := filepath.Join(s.cfg.WorkspaceRoot, "analyzers", fmt.Sprintf("thread-%d", threadID))
-	if err := os.MkdirAll(workspace, 0o755); err != nil {
-		s.finishAnalysisError(threadID, analysisID, err)
+	workspace := s.threadWorkspace(threadID)
+	if ok := s.ensureAnalyzerWorkspace(threadID, analysisID, workspace); !ok {
 		return false
 	}
 	client, err := NewCodexClient(s.cfg.ResolvedCodexBin())
@@ -1048,7 +1053,7 @@ func (s *Service) runAnalysis(threadID int64) bool {
 		s.finishAnalysisError(threadID, analysisID, err)
 		return false
 	}
-	turn := client.RunTurn(codexThreadID, analysisPrompt(thread, messages), 10*time.Minute)
+	turn := client.RunTurn(codexThreadID, analysisPrompt(thread, messages, s.relatedJobsForThread(threadID, 20)), 10*time.Minute)
 	final := turn.FinalText
 	analysis := parseAnalysisOutput(final)
 	status := "completed"
@@ -1095,12 +1100,13 @@ func (s *Service) runAnalysis(threadID int64) bool {
 	insertResult, err := s.store.db.Exec(`
 		INSERT INTO jobs(
 			slack_thread_id, analysis_run_id, title, status, urgency, task_type,
-			created_at, updated_at
-		) VALUES (?, ?, ?, 'queued', ?, 'slack_task', ?, ?)`,
+			workspace_path, bootstrap_status, created_at, updated_at
+		) VALUES (?, ?, ?, 'queued', ?, 'slack_task', ?, 'succeeded', ?, ?)`,
 		threadID,
 		analysisID,
 		title,
 		urgency,
+		workspace,
 		utcNow(),
 		utcNow(),
 	)
@@ -1119,6 +1125,32 @@ func (s *Service) finishAnalysisError(threadID, analysisID int64, err error) {
 	_, _ = s.store.db.Exec("UPDATE slack_threads SET status='analysis_queued' WHERE id=?", threadID)
 }
 
+func (s *Service) ensureAnalyzerWorkspace(threadID, analysisID int64, workspace string) bool {
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		s.finishAnalysisError(threadID, analysisID, fmt.Errorf("analyzer workspace creation failed: %w", err))
+		return false
+	}
+	bootstrap := s.cfg.ResolvedBootstrapCommand()
+	if bootstrap == "" {
+		s.finishAnalysisError(threadID, analysisID, fmt.Errorf("analyzer workspace bootstrap command was not found: %s", s.cfg.WorkspaceBootstrapCommand))
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-lc", bootstrap)
+	cmd.Dir = workspace
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		s.finishAnalysisError(threadID, analysisID, fmt.Errorf("analyzer workspace bootstrap failed: %w: %s", err, truncate(string(output), 4000)))
+		return false
+	}
+	return true
+}
+
+func (s *Service) threadWorkspace(threadID int64) string {
+	return filepath.Join(s.cfg.WorkspaceRoot, fmt.Sprintf("thread-%d", threadID))
+}
+
 func (s *Service) runJob(jobID int64) bool {
 	if !s.claimJob(jobID) {
 		return false
@@ -1127,7 +1159,7 @@ func (s *Service) runJob(jobID int64) bool {
 	if err != nil {
 		return false
 	}
-	workspace := filepath.Join(s.cfg.WorkspaceRoot, fmt.Sprintf("job-%d", jobID))
+	workspace := s.jobWorkspace(jobID, job)
 	if ok := s.ensureJobWorkspace(jobID, job, workspace); !ok {
 		return false
 	}
@@ -1156,6 +1188,16 @@ func (s *Service) runJob(jobID int64) bool {
 	}
 	s.finishJobFromWorkerOutput(jobID, turn.FinalText)
 	return true
+}
+
+func (s *Service) jobWorkspace(jobID int64, job map[string]any) string {
+	if workspace, ok := nonEmptyMapString(job["workspace_path"]); ok {
+		return workspace
+	}
+	if threadID, ok := int64Value(job["slack_thread_id"]); ok && threadID > 0 {
+		return s.threadWorkspace(threadID)
+	}
+	return filepath.Join(s.cfg.WorkspaceRoot, fmt.Sprintf("job-%d", jobID))
 }
 
 func (s *Service) claimJob(jobID int64) bool {
@@ -1267,7 +1309,8 @@ func (s *Service) SendReply(replyID int64) (map[string]any, error) {
 	if isEmptyReplyDraft(text) || looksLikeProcessNote(text) {
 		return nil, fmt.Errorf("reply draft looks like worker process notes; edit it before sending")
 	}
-	payload, err := NewSlackClient(s.cfg).ChatPostMessage(fmt.Sprint(reply["slack_channel_id"]), fmt.Sprint(reply["slack_thread_ts"]), text)
+	client := NewSlackClient(s.cfg)
+	payload, err := client.ChatPostMessage(fmt.Sprint(reply["slack_channel_id"]), fmt.Sprint(reply["slack_thread_ts"]), text)
 	if err != nil {
 		_, _ = s.store.db.Exec("UPDATE reply_drafts SET status='send_failed', updated_at=? WHERE id=?", utcNow(), replyID)
 		return nil, err
@@ -1276,7 +1319,7 @@ func (s *Service) SendReply(replyID int64) (map[string]any, error) {
 	channel, _ := payload["channel"].(string)
 	permalink := ""
 	if ts != "" && channel != "" {
-		permalink = fmt.Sprintf("slack://channel?id=%s&message=%s", channel, ts)
+		permalink, _ = client.ChatGetPermalink(channel, ts)
 	}
 	_, _ = s.store.db.Exec("UPDATE reply_drafts SET status='sent', slack_message_ts=?, sent_permalink=?, updated_at=? WHERE id=?", ts, permalink, utcNow(), replyID)
 	_, _ = s.store.db.Exec("UPDATE slack_threads SET status='archived' WHERE id=?", reply["slack_thread_id"])
@@ -1345,6 +1388,52 @@ func (s *Service) threadContext(threadID int64) (map[string]any, []map[string]an
 	}
 	messages, err := s.store.queryMaps("SELECT * FROM slack_messages WHERE slack_thread_id=? ORDER BY slack_message_ts", threadID)
 	return threads[0], messages, err
+}
+
+func (s *Service) relatedJobsForThread(threadID int64, limit int) []map[string]any {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.store.queryMaps(`
+		SELECT j.id, j.slack_thread_id, j.title, j.status, j.urgency, j.task_type,
+		       j.current_block_reason, j.next_user_action, j.created_at, j.updated_at,
+		       st.channel_id, st.channel_name, st.thread_ts, st.source_type,
+		       st.title AS thread_title, st.last_slack_activity_at, st.latest_slack_message_ts,
+		       ar.summary AS analyzer_summary, ar.rationale AS analyzer_rationale,
+		       (
+		         SELECT rd.status
+		         FROM reply_drafts rd
+		         WHERE rd.job_id = j.id
+		         ORDER BY rd.updated_at DESC, rd.id DESC
+		         LIMIT 1
+		       ) AS latest_reply_status,
+		       (
+		         SELECT rd.updated_at
+		         FROM reply_drafts rd
+		         WHERE rd.job_id = j.id
+		         ORDER BY rd.updated_at DESC, rd.id DESC
+		         LIMIT 1
+		       ) AS latest_reply_updated_at
+		FROM jobs j
+		JOIN slack_threads st ON st.id = j.slack_thread_id
+		JOIN slack_threads trigger_thread ON trigger_thread.id = ?
+		LEFT JOIN analysis_runs ar ON ar.id = (
+			SELECT id
+			FROM analysis_runs
+			WHERE slack_thread_id = st.id
+			ORDER BY id DESC
+			LIMIT 1
+		)
+		WHERE st.slack_team_id = trigger_thread.slack_team_id
+		  AND st.channel_id = trigger_thread.channel_id
+		ORDER BY COALESCE(st.last_slack_activity_at, j.updated_at, j.created_at) DESC,
+		         j.updated_at DESC,
+		         j.id DESC
+		LIMIT ?`, threadID, limit)
+	if err != nil {
+		return nil
+	}
+	return rows
 }
 
 func (s *Service) job(jobID int64) (map[string]any, error) {
@@ -1549,8 +1638,14 @@ func (s *Service) finishJobFromWorkerOutput(jobID int64, finalText string) {
 	}
 }
 
-func analysisPrompt(thread map[string]any, messages []map[string]any) string {
-	return fmt.Sprintf(`Analyze this Slack thread for my personal work agent.
+func analysisPrompt(thread map[string]any, messages []map[string]any, relatedJobs []map[string]any) string {
+	return fmt.Sprintf(`Analyze this Slack intake trigger for my personal work agent.
+
+This Slack message/thread is a trigger event. Do not assume it is a standalone task.
+
+Before deciding, use the available Slack context skill/capabilities from the workspace when useful. For DMs especially, inspect nearby messages in the same DM around the trigger timestamp; people often continue the same topic as separate DM messages instead of Slack thread replies. If the trigger belongs to a native Slack thread, inspect the full thread as well.
+
+Related jobs from the same Slack DM/channel are included below, sorted by most recent activity, with at most 20 jobs. Also check whether the same topic is already covered by an existing or running job, a pending reply draft, a sent system reply, or my own Slack reply. If it is already covered or already answered, do not create another worker job.
 
 Decide whether I need to take action. If action is needed, summarize the task and what a worker should try.
 
@@ -1569,6 +1664,7 @@ Return exactly one JSON object and no Markdown or prose. Use this schema:
 
 Rules:
 - Use action_required=false when no worker should be created.
+- Use action_required=false when this trigger is only additional context for an existing/running job, or when the latest relevant user-facing Slack reply already answered it.
 - Confidence must be a number from 0 to 1, not a word.
 - Keep values Slack-work focused and concise.
 - Keep JSON keys exactly as shown, but write user-facing string values in Simplified Chinese, including summary, task_title, why_it_matters, worker_plan, needed_user_confirmation, and rationale.
@@ -1578,7 +1674,10 @@ Slack thread:
 
 Messages:
 %s
-`, thread, transcript(messages))
+
+Related jobs from same Slack DM/channel:
+%v
+`, thread, transcript(messages), relatedJobs)
 }
 
 func workerPrompt(job map[string]any, messages []map[string]any) string {
@@ -1586,7 +1685,10 @@ func workerPrompt(job map[string]any, messages []map[string]any) string {
 
 You may use local files, commands, repos, tests, and tools that work inside the local Codex workspace to move this task forward.
 Network access and permissions outside the local workspace are intentionally unavailable by default. If they are required, report the blocker instead of waiting for approval.
+Before working, use the available Slack context skill/capabilities from the workspace when useful to refresh the latest relevant Slack context. For DM jobs, inspect nearby messages in the same DM around the original trigger and any newer messages in the same conversation; people often continue the same topic as separate DM messages instead of Slack thread replies.
+If refreshed context shows this topic is already handled by another active job, a sent system reply, or my own Slack reply after the latest relevant external message, stop without drafting another reply and report completed_no_reply with evidence.
 Hard policy: do not send Slack messages. If a Slack reply is useful, draft it only.
+Before drafting a Slack reply, check again whether a Slack reply has already been sent or I have already replied after the latest relevant external message.
 The Slack reply draft must be only the exact text I could send to Slack. Do not include process notes, database details, marker names, implementation commentary, or anything about this worker format. If no safe direct Slack reply is ready, write SLACK_REPLY_DRAFT: NONE.
 
 When finished, include:
@@ -1766,6 +1868,14 @@ func nullIfEmpty(value string) any {
 		return nil
 	}
 	return value
+}
+
+func nonEmptyMapString(value any) (string, bool) {
+	text := strings.TrimSpace(fmt.Sprint(value))
+	if text == "" || text == "<nil>" {
+		return "", false
+	}
+	return text, true
 }
 
 func int64Value(value any) (int64, bool) {
