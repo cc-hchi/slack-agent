@@ -26,13 +26,14 @@ Shows Slack-derived work grouped by state:
 
 The default sort should put reply drafts and blockers first.
 
-### Thread Detail
+### Intake Detail
 
 Shows:
 
-- Slack thread summary.
-- Original messages.
-- Why the item was collected.
+- Slack intake summary.
+- Trigger summary and Slack permalink.
+- Live Slack context refresh status when analyzer or worker has fetched it.
+- Why the item was captured.
 - Analyzer decision and confidence.
 - Linked job if one exists.
 
@@ -106,4 +107,3 @@ Generate three desktop dashboard concepts at 1440 x 1024:
 1. Queue-first command center.
 2. Split-pane thread and job triage.
 3. Timeline-first operations console.
-

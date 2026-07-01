@@ -3,43 +3,35 @@ CREATE TABLE IF NOT EXISTS metadata (
   value TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS slack_threads (
+CREATE TABLE IF NOT EXISTS intake_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   slack_team_id TEXT NOT NULL,
   channel_id TEXT NOT NULL,
   channel_name TEXT,
+  trigger_ts TEXT NOT NULL,
   thread_ts TEXT NOT NULL,
-  root_message_ts TEXT,
   source_type TEXT NOT NULL,
   status TEXT NOT NULL,
+  resolution TEXT,
   title TEXT,
   permalink TEXT,
-  last_slack_activity_at TEXT,
+  trigger_user_id TEXT,
+  trigger_text TEXT,
   latest_slack_message_ts TEXT,
+  latest_user_id TEXT,
+  latest_user_name TEXT,
+  latest_text TEXT,
   last_analyzed_slack_ts TEXT,
   last_synced_at TEXT,
   raw_json TEXT,
-  UNIQUE(slack_team_id, channel_id, thread_ts)
+  UNIQUE(slack_team_id, channel_id, trigger_ts)
 );
 
-CREATE INDEX IF NOT EXISTS idx_slack_threads_status_activity
-  ON slack_threads(status, last_slack_activity_at);
+CREATE INDEX IF NOT EXISTS idx_intake_items_status_latest_ts
+  ON intake_items(status, latest_slack_message_ts);
 
-CREATE TABLE IF NOT EXISTS slack_messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  slack_thread_id INTEGER NOT NULL REFERENCES slack_threads(id) ON DELETE CASCADE,
-  slack_message_ts TEXT NOT NULL,
-  user_id TEXT,
-  user_name TEXT,
-  text TEXT,
-  is_user_message INTEGER NOT NULL DEFAULT 0,
-  mentions_user INTEGER NOT NULL DEFAULT 0,
-  raw_json TEXT,
-  UNIQUE(slack_thread_id, slack_message_ts)
-);
-
-CREATE INDEX IF NOT EXISTS idx_slack_messages_thread_ts
-  ON slack_messages(slack_thread_id, slack_message_ts);
+CREATE INDEX IF NOT EXISTS idx_intake_items_latest_ts
+  ON intake_items(latest_slack_message_ts);
 
 CREATE TABLE IF NOT EXISTS slack_users (
   user_id TEXT PRIMARY KEY,
@@ -54,8 +46,9 @@ CREATE TABLE IF NOT EXISTS slack_users (
 
 CREATE TABLE IF NOT EXISTS analysis_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  slack_thread_id INTEGER NOT NULL REFERENCES slack_threads(id) ON DELETE CASCADE,
+  intake_item_id INTEGER NOT NULL REFERENCES intake_items(id) ON DELETE CASCADE,
   codex_thread_id TEXT,
+  codex_session_id TEXT,
   status TEXT NOT NULL,
   action_required INTEGER,
   confidence REAL,
@@ -67,9 +60,15 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
   error TEXT
 );
 
+CREATE INDEX IF NOT EXISTS idx_analysis_runs_intake_latest
+  ON analysis_runs(intake_item_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_runs_codex_session_id
+  ON analysis_runs(codex_session_id);
+
 CREATE TABLE IF NOT EXISTS jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  slack_thread_id INTEGER NOT NULL REFERENCES slack_threads(id) ON DELETE CASCADE,
+  intake_item_id INTEGER NOT NULL REFERENCES intake_items(id) ON DELETE CASCADE,
   analysis_run_id INTEGER REFERENCES analysis_runs(id) ON DELETE SET NULL,
   title TEXT NOT NULL,
   status TEXT NOT NULL,
@@ -78,14 +77,18 @@ CREATE TABLE IF NOT EXISTS jobs (
   workspace_path TEXT,
   bootstrap_status TEXT,
   codex_thread_id TEXT,
+  codex_session_id TEXT,
   current_block_reason TEXT,
   next_user_action TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_jobs_slack_thread_id
-  ON jobs(slack_thread_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_intake_item_id
+  ON jobs(intake_item_id);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_codex_session_id
+  ON jobs(codex_session_id);
 
 CREATE TABLE IF NOT EXISTS job_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,15 +99,22 @@ CREATE TABLE IF NOT EXISTS job_events (
   created_at TEXT NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_job_events_created_at
+  ON job_events(created_at DESC);
+
 CREATE TABLE IF NOT EXISTS worker_sessions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
   codex_thread_id TEXT,
+  codex_session_id TEXT,
   status TEXT NOT NULL,
   started_at TEXT,
   completed_at TEXT,
   error TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_worker_sessions_codex_session_id
+  ON worker_sessions(codex_session_id);
 
 CREATE TABLE IF NOT EXISTS worker_artifacts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,7 +129,7 @@ CREATE TABLE IF NOT EXISTS worker_artifacts (
 CREATE TABLE IF NOT EXISTS reply_drafts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
-  slack_thread_id INTEGER NOT NULL REFERENCES slack_threads(id) ON DELETE CASCADE,
+  intake_item_id INTEGER NOT NULL REFERENCES intake_items(id) ON DELETE CASCADE,
   status TEXT NOT NULL,
   draft_text TEXT NOT NULL,
   edited_text TEXT,

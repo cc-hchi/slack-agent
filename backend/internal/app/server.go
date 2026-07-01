@@ -24,6 +24,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/dashboard", s.handleDashboard)
 	mux.HandleFunc("POST /api/sync", s.handleSync)
+	mux.HandleFunc("POST /api/intake/", s.handleIntake)
 	mux.HandleFunc("POST /api/threads/", s.handleThreads)
 	mux.HandleFunc("POST /api/jobs/", s.handleJobs)
 	mux.HandleFunc("PATCH /api/replies/", s.handleReplies)
@@ -55,6 +56,24 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleThreads(w http.ResponseWriter, r *http.Request) {
 	id, suffix, ok := parseActionPath(r.URL.Path, "/api/threads/")
+	if !ok || suffix != "analyze" {
+		http.NotFound(w, r)
+		return
+	}
+	result, err := s.service.QueueAnalysis(id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleIntake(w http.ResponseWriter, r *http.Request) {
+	id, suffix, ok := parseActionPath(r.URL.Path, "/api/intake/")
 	if !ok || suffix != "analyze" {
 		http.NotFound(w, r)
 		return

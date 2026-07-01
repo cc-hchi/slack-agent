@@ -23,11 +23,12 @@ Codex event payloads for auditability.
 
 Responsibilities:
 
-- Discover relevant threads and DMs.
-- Fetch thread history snapshots.
-- De-duplicate by Slack team, channel, thread timestamp, and message timestamp.
-- Store raw Slack messages and normalized thread metadata locally.
-- Mark new or changed threads for analysis.
+- Discover relevant Slack trigger messages from mentions and DMs.
+- Fetch enough Slack metadata to identify the trigger message, thread context, latest
+  activity, and display summary.
+- De-duplicate by Slack team, channel, and trigger timestamp.
+- Store normalized intake metadata locally, not full Slack message transcripts.
+- Mark new or changed intake items for analysis.
 
 First version should support both a manual "sync now" action and a background
 interval.
@@ -38,13 +39,15 @@ Slack source rules:
 - Mentions of the user qualify.
 - Threads where the user has posted qualify.
 
-### Thread Analyzer
+### Intake Analyzer
 
 Responsibilities:
 
-- Create a dedicated Slack-thread workspace and run workspace bootstrap.
-- Start a dedicated Codex thread for one Slack thread snapshot.
+- Create a dedicated intake workspace and run workspace bootstrap.
+- Start a dedicated Codex thread for one Slack trigger.
 - Ask Codex whether the Slack context requires user action.
+- Have Codex fetch the latest Slack messages live before deciding; the local DB
+  only provides thread coordinates and summary fields.
 - Require structured output:
   - action required or not.
   - confidence.
@@ -76,7 +79,7 @@ Responsibilities:
 Workspace initialization:
 
 1. Use the job's persisted `workspace_path` when present.
-2. Otherwise derive the workspace from the Slack thread id.
+2. Otherwise derive the workspace from the intake item id.
 3. If no bootstrapped workspace exists, run the configurable bootstrap command.
    Default:
    `install-chi-skills`
@@ -99,7 +102,7 @@ Codex app-server protocol:
 - Send `initialize`.
 - Send `initialized`.
 - Send `thread/start` with the job workspace cwd.
-- Send `turn/start` with the worker prompt and Slack context.
+- Send `turn/start` with the worker prompt and Slack intake coordinates.
 - Stream `item/*` and `turn/completed` notifications.
 
 Do not depend on the local app-server daemon control socket in the first
@@ -131,15 +134,15 @@ Responsibilities:
 
 ## State Machine
 
-Thread states:
+Intake item states:
 
-- `collected`
-- `analysis_queued`
-- `analyzing`
-- `no_action`
-- `job_created`
-- `analysis_failed`
-- `archived`
+- `pending`
+- `resolved`
+
+`intake_items.resolution` records why a resolved item left intake, for example
+`no_action`, `job_created`, `reply_sent`, `reply_ignored`, or
+`completed_no_reply`. Analyzer queued/running state is runtime-only and is kept
+in memory so pending items retry naturally after restart.
 
 Job states:
 
@@ -167,8 +170,8 @@ Reply states:
 
 Core tables:
 
-- `slack_threads`
-- `slack_messages`
+- `intake_items`
+- `slack_users`
 - `analysis_runs`
 - `jobs`
 - `job_events`
@@ -178,38 +181,45 @@ Core tables:
 - `settings`
 - `health_checks`
 
-### slack_threads
+### intake_items
 
 - id
 - slack_team_id
 - channel_id
 - channel_name
+- trigger_ts
 - thread_ts
-- root_message_ts
 - source_type: `user_participated`, `mention`, `dm`
 - status
-- last_slack_activity_at
+- resolution
+- trigger_user_id
+- trigger_text
+- latest_slack_message_ts
+- latest_user_id
+- latest_user_name
+- latest_text
+- last_analyzed_slack_ts
 - last_synced_at
 - permalink
 - raw_json
 
-### slack_messages
+### slack_users
 
-- id
-- slack_thread_id
-- slack_message_ts
 - user_id
-- user_name
-- text
-- is_user_message
-- mentions_user
+- display_name
+- real_name
+- team_id
+- is_bot
+- deleted
 - raw_json
+- updated_at
 
 ### analysis_runs
 
 - id
-- slack_thread_id
+- intake_item_id
 - codex_thread_id
+- codex_session_id
 - status
 - action_required
 - confidence
@@ -223,7 +233,7 @@ Core tables:
 ### jobs
 
 - id
-- slack_thread_id
+- intake_item_id
 - analysis_run_id
 - title
 - status
@@ -260,7 +270,7 @@ Core tables:
 
 - id
 - job_id
-- slack_thread_id
+- intake_item_id
 - status
 - draft_text
 - edited_text
@@ -276,7 +286,7 @@ Core tables:
 
 Each worker prompt should include:
 
-- Slack thread snapshot.
+- Slack intake trigger and context coordinates.
 - Analyzer result.
 - Hard policy: do not send Slack messages.
 - Allowed actions: local files, commands, network, repos, PRs, docs, tests.

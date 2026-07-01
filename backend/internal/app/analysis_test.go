@@ -8,7 +8,7 @@ import (
 )
 
 func TestAnalysisPromptRequiresChineseUserFacingStrings(t *testing.T) {
-	prompt := analysisPrompt(map[string]any{"title": "Need help"}, nil, nil)
+	prompt := analysisPrompt(map[string]any{"title": "Need help"}, nil)
 
 	for _, want := range []string{
 		`"task_title": "简短中文工作项标题"`,
@@ -22,11 +22,13 @@ func TestAnalysisPromptRequiresChineseUserFacingStrings(t *testing.T) {
 }
 
 func TestAnalysisPromptRequiresSlackContextRouting(t *testing.T) {
-	prompt := analysisPrompt(map[string]any{"title": "Need help", "source_type": "dm"}, nil, nil)
+	prompt := analysisPrompt(map[string]any{"title": "Need help", "source_type": "dm"}, nil)
 
 	for _, want := range []string{
 		"trigger event",
+		"stores only Slack trigger metadata",
 		"Slack context skill",
+		"fetch the latest relevant Slack messages",
 		"nearby messages in the same DM",
 		"Related jobs from the same Slack DM/channel",
 		"at most 20 jobs",
@@ -41,10 +43,12 @@ func TestAnalysisPromptRequiresSlackContextRouting(t *testing.T) {
 }
 
 func TestWorkerPromptRequiresSlackContextRefresh(t *testing.T) {
-	prompt := workerPrompt(map[string]any{"title": "Need help"}, nil)
+	prompt := workerPrompt(map[string]any{"title": "Need help"})
 
 	for _, want := range []string{
+		"stores only Slack trigger metadata",
 		"refresh the latest relevant Slack context",
+		"channel_id, thread_ts, and permalink",
 		"nearby messages in the same DM",
 		"already handled by another active job",
 		"my own Slack reply after the latest relevant external message",

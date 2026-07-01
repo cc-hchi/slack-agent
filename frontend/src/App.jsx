@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive,
   Bot,
@@ -49,11 +49,30 @@ export function App() {
   const [draftText, setDraftText] = useState("");
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const refreshInFlight = useRef(null);
 
   const refresh = async () => {
-    const data = await api("/api/dashboard");
-    setSnapshot(data);
-    setSelected((current) => (resolveSelected(data, current) ? current : pickInitialSelection(data)));
+    if (refreshInFlight.current) {
+      return refreshInFlight.current;
+    }
+    refreshInFlight.current = api("/api/dashboard")
+      .then((data) => {
+        setSnapshot(data);
+        setSelected((current) => (resolveSelected(data, current) ? current : pickInitialSelection(data)));
+        return data;
+      })
+      .finally(() => {
+        refreshInFlight.current = null;
+      });
+    return refreshInFlight.current;
+  };
+
+  const refreshAfterCurrent = async () => {
+    const current = refreshInFlight.current;
+    if (current) {
+      await current.catch(() => {});
+    }
+    return refresh();
   };
 
   useEffect(() => {
@@ -75,7 +94,7 @@ export function App() {
     setError("");
     try {
       await fn();
-      await refresh();
+      await refreshAfterCurrent();
     } catch (err) {
       setError(err.message);
     } finally {
@@ -200,8 +219,8 @@ export function App() {
                   {hasConfidence(draft.confidence) && <Progress value={Number(draft.confidence)} />}
                   {formatConfidence(draft.confidence)}
                 </span>
-                <span title={dateTimeFull(draft.last_slack_activity_at)}>
-                  {displayActivityTime(draft.last_slack_activity_at)}
+                <span title={dateTimeFull(draft.latest_slack_message_ts)}>
+                  {displayActivityTime(draft.latest_slack_message_ts)}
                 </span>
                 <SlackLinkButton item={draft} />
               </SelectableRow>
@@ -217,7 +236,7 @@ export function App() {
           <div className="table-shell">
             <div className="intake-table header">
               <span>From</span>
-              <span>Thread</span>
+              <span>Trigger</span>
               <span>Channel</span>
               <span>Status</span>
               <span>Activity</span>
@@ -235,7 +254,7 @@ export function App() {
                   <small>{sourceLabel(thread.source_type)}</small>
                 </span>
                 <span>
-                  <strong>{thread.title || "Untitled Slack thread"}</strong>
+                  <strong>{thread.title || "Untitled intake item"}</strong>
                   <small>{thread.thread_ts}</small>
                 </span>
                 <span>
@@ -243,11 +262,11 @@ export function App() {
                   <small>{thread.channel_id}</small>
                 </span>
                 <span>
-                  <StateBadge tone={thread.status === "analysis_failed" ? "warn" : "neutral"}>
+                  <StateBadge tone="neutral">
                     {statusLabel(thread.status)}
                   </StateBadge>
                 </span>
-                <span title={dateTimeFull(thread.last_slack_activity_at)}>{activityTime(thread.last_slack_activity_at)}</span>
+                <span title={dateTimeFull(thread.latest_slack_message_ts)}>{activityTime(thread.latest_slack_message_ts)}</span>
                 <SlackLinkButton item={thread} />
               </SelectableRow>
             ))}
@@ -386,7 +405,7 @@ export function App() {
                   <small>{sourceLabel(thread.source_type)}</small>
                 </span>
                 <span>
-                  <strong>{thread.title || "Untitled Slack thread"}</strong>
+                  <strong>{thread.title || "Untitled intake item"}</strong>
                   <small>{thread.thread_ts}</small>
                 </span>
                 <span>
@@ -396,7 +415,7 @@ export function App() {
                 <span>
                   <StateBadge tone="good">{statusLabel(thread.status)}</StateBadge>
                 </span>
-                <span title={dateTimeFull(thread.last_slack_activity_at)}>{activityTime(thread.last_slack_activity_at)}</span>
+                <span title={dateTimeFull(thread.latest_slack_message_ts)}>{activityTime(thread.latest_slack_message_ts)}</span>
                 <SlackLinkButton item={thread} />
               </SelectableRow>
             ))}
@@ -486,7 +505,7 @@ export function App() {
               <DetailContent
                 detail={selectedDetail}
                 tab={tab}
-                onAnalyze={(threadID) => runAction("analyze", () => api(`/api/threads/${threadID}/analyze`, { method: "POST" }))}
+                onAnalyze={(threadID) => runAction("analyze", () => api(`/api/intake/${threadID}/analyze`, { method: "POST" }))}
                 onRunJob={(jobID) => runAction("run-job", () => api(`/api/jobs/${jobID}/run`, { method: "POST" }))}
                 busy={busy}
               />
@@ -559,13 +578,7 @@ function DetailContent({ detail, tab, onAnalyze, onRunJob, busy }) {
             disabled={busy === "analyze"}
           >
             {busy === "analyze" ? <Loader2 size={16} className="spin" /> : <RefreshCw size={16} />}
-            Analyze thread
-          </button>
-        )}
-        {isAnalysisInFlight(detail.thread) && !detail.job && (
-          <button className="primary-lite-button full" type="button" disabled>
-            <Loader2 size={16} className="spin" />
-            {detail.thread.status === "analysis_queued" ? "Analysis queued" : "Analyzing thread"}
+            Analyze intake
           </button>
         )}
       </section>
@@ -580,7 +593,7 @@ function DetailContent({ detail, tab, onAnalyze, onRunJob, busy }) {
     <>
       <AnalyzerPanel detail={detail} mode="summary" />
       <section className="detail-card">
-        <h4>Slack thread</h4>
+        <h4>Slack intake</h4>
         <p className="thread-text">{slackThreadText(detail)}</p>
         {slackLink && (
           <a className="external-link" href={slackLink} target="_blank" rel="noreferrer">
@@ -595,13 +608,7 @@ function DetailContent({ detail, tab, onAnalyze, onRunJob, busy }) {
             disabled={busy === "analyze"}
           >
             {busy === "analyze" ? <Loader2 size={16} className="spin" /> : <RefreshCw size={16} />}
-            Analyze thread
-          </button>
-        )}
-        {isAnalysisInFlight(detail.thread) && !detail.job && (
-          <button className="primary-lite-button full" type="button" disabled>
-            <Loader2 size={16} className="spin" />
-            {detail.thread.status === "analysis_queued" ? "Analysis queued" : "Analyzing thread"}
+            Analyze intake
           </button>
         )}
       </section>
@@ -920,7 +927,7 @@ function firstReplyDraft(data) {
 
 function sortBySlackActivity(items = []) {
   return [...(items ?? [])].sort(
-    (left, right) => dateMillis(right.last_slack_activity_at) - dateMillis(left.last_slack_activity_at),
+    (left, right) => dateMillis(right.latest_slack_message_ts) - dateMillis(left.latest_slack_message_ts),
   );
 }
 
@@ -946,7 +953,7 @@ function resolveSelected(snapshot, selected) {
       ...(snapshot.threads ?? []),
     ].find((item) => item.id === selected.id);
     if (!thread) return null;
-    const job = jobs.find((item) => item.slack_thread_id === thread.id);
+    const job = jobs.find((item) => item.intake_item_id === thread.id);
     return {
       job,
       thread,
@@ -963,7 +970,7 @@ function resolveSelected(snapshot, selected) {
     if (!reply) return null;
     const job = jobs.find((item) => item.id === reply.job_id);
     const thread =
-      threads.find((item) => item.id === reply.slack_thread_id) ||
+      threads.find((item) => item.id === reply.intake_item_id) ||
       minimalThreadFromReply(reply);
     return {
       reply,
@@ -979,7 +986,7 @@ function resolveSelected(snapshot, selected) {
   }
   const job = jobs.find((item) => item.id === selected.id) || snapshot.blocked?.find((item) => item.id === selected.id);
   if (!job) return null;
-  const thread = threads.find((item) => item.id === job.slack_thread_id) || minimalThreadFromJob(job);
+  const thread = threads.find((item) => item.id === job.intake_item_id) || minimalThreadFromJob(job);
   return {
     job,
     thread,
@@ -991,34 +998,34 @@ function resolveSelected(snapshot, selected) {
 function minimalThreadFromReply(reply) {
   if (!reply) return null;
   return {
-    id: reply.slack_thread_id,
+    id: reply.intake_item_id,
     title: reply.thread_title || reply.job_title,
     channel_id: reply.channel_id || reply.slack_channel_id,
     channel_name: reply.channel_name,
     source_type: reply.source_type,
     thread_ts: reply.thread_ts || reply.slack_thread_ts,
     permalink: reply.permalink,
-    last_slack_activity_at: reply.last_slack_activity_at,
-    root_user_name: reply.root_user_name,
-    root_user_id: reply.root_user_id,
-    root_text: reply.root_text,
+    latest_slack_message_ts: reply.latest_slack_message_ts,
+    trigger_display_name: reply.trigger_display_name,
+    trigger_user_id: reply.trigger_user_id,
+    trigger_text: reply.trigger_text,
   };
 }
 
 function minimalThreadFromJob(job) {
   if (!job) return null;
   return {
-    id: job.slack_thread_id,
+    id: job.intake_item_id,
     title: job.thread_title || job.title,
     channel_id: job.channel_id,
     channel_name: job.channel_name,
     source_type: job.source_type,
     thread_ts: job.thread_ts,
     permalink: job.permalink,
-    last_slack_activity_at: job.last_slack_activity_at || job.updated_at,
-    root_user_name: job.root_user_name,
-    root_user_id: job.root_user_id,
-    root_text: job.root_text,
+    latest_slack_message_ts: job.latest_slack_message_ts,
+    trigger_display_name: job.trigger_display_name,
+    trigger_user_id: job.trigger_user_id,
+    trigger_text: job.trigger_text,
   };
 }
 
@@ -1119,8 +1126,8 @@ function analyzerBadgeLabel(draft) {
 function slackThreadText(detail) {
   return (
     detail.message?.text ||
-    detail.thread?.root_text ||
-    detail.reply?.root_text ||
+    detail.thread?.trigger_text ||
+    detail.reply?.trigger_text ||
     detail.thread?.title ||
     detail.reply?.thread_title ||
     "Thread snapshot not loaded yet."
@@ -1154,7 +1161,7 @@ function sourceLabel(value) {
 }
 
 function actorName(item) {
-  return item?.root_user_name || item?.root_user_id || "Slack";
+  return item?.trigger_display_name || item?.trigger_user_id || "Slack";
 }
 
 function sourceMeta(item) {
@@ -1180,16 +1187,16 @@ function statusLabel(value) {
 function detailStatus(detail) {
   if (detail.reply) return "Reply draft ready for review";
   if (detail.job?.status === "blocked") return "Blocked: needs your input";
-  if (detail.thread && !detail.job) return statusLabel(detail.thread.status || "collected");
+  if (detail.thread && !detail.job) return statusLabel(detail.thread.resolution || detail.thread.status || "pending");
   return statusLabel(detail.job?.status);
 }
 
 function detailActor(detail) {
   return (
-    detail.thread?.root_user_name ||
-    detail.thread?.root_user_id ||
-    detail.reply?.root_user_name ||
-    detail.reply?.root_user_id ||
+    detail.thread?.trigger_display_name ||
+    detail.thread?.trigger_user_id ||
+    detail.reply?.trigger_display_name ||
+    detail.reply?.trigger_user_id ||
     "Slack"
   );
 }
@@ -1200,7 +1207,7 @@ function detailSource(detail) {
 
 function detailTime(detail) {
   return timeOnly(
-    detail.thread?.last_slack_activity_at ||
+    detail.thread?.latest_slack_message_ts ||
       detail.reply?.updated_at ||
       detail.job?.updated_at,
   );
@@ -1208,11 +1215,7 @@ function detailTime(detail) {
 
 function canAnalyzeThread(thread, job) {
   if (!thread || job) return false;
-  return ["collected", "analysis_failed"].includes(thread.status);
-}
-
-function isAnalysisInFlight(thread) {
-  return ["analysis_queued", "analyzing"].includes(thread?.status);
+  return thread.status === "pending";
 }
 
 function canRunJob(job) {
@@ -1248,14 +1251,14 @@ function hasConfidence(value) {
 
 function dateMillis(value) {
   if (!value) return 0;
-  const date = new Date(value);
+  const date = dateFromValue(value);
   if (Number.isNaN(date.getTime())) return 0;
   return date.getTime();
 }
 
 function timeOnly(value) {
   if (!value) return "now";
-  const date = new Date(value);
+  const date = dateFromValue(value);
   if (Number.isNaN(date.getTime())) return String(value).slice(11, 16) || "now";
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
@@ -1267,7 +1270,7 @@ function displayActivityTime(value) {
 
 function activityTime(value) {
   if (!value) return "now";
-  const date = new Date(value);
+  const date = dateFromValue(value);
   if (Number.isNaN(date.getTime())) return String(value).slice(0, 10) || "recent";
   const today = new Date();
   if (date.toDateString() === today.toDateString()) {
@@ -1278,7 +1281,7 @@ function activityTime(value) {
 
 function dateTimeFull(value) {
   if (!value) return "";
-  const date = new Date(value);
+  const date = dateFromValue(value);
   if (Number.isNaN(date.getTime())) return String(value);
   return date.toLocaleString([], {
     year: "numeric",
@@ -1287,6 +1290,17 @@ function dateTimeFull(value) {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function dateFromValue(value) {
+  const text = String(value || "");
+  const slackMatch = text.match(/^(\d{10})(?:\.(\d{1,6}))?$/);
+  if (slackMatch) {
+    const seconds = Number(slackMatch[1]);
+    const micros = Number((slackMatch[2] || "0").padEnd(6, "0"));
+    return new Date(seconds * 1000 + Math.floor(micros / 1000));
+  }
+  return new Date(value);
 }
 
 function relativeTime(value) {

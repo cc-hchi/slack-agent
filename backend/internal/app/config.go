@@ -14,12 +14,12 @@ type Config struct {
 	DatabasePath              string
 	WorkspaceRoot             string
 	SeedDemoData              bool
-	AutoAdvance               bool
 	SlackBotToken             string
 	SlackUserToken            string
 	SlackUserID               string
 	SlackUserSearchName       string
 	SlackIncludeParticipated  bool
+	SlackSyncIntervalSeconds  int
 	CodexBin                  string
 	CodexPermissionProfile    string
 	CodexSandboxMode          string
@@ -45,12 +45,12 @@ func LoadConfig() Config {
 		DatabasePath:              env("SLACK_AGENT_DB_PATH", "data/slack_agent.db"),
 		WorkspaceRoot:             env("SLACK_AGENT_WORKSPACE_ROOT", "data/workspaces"),
 		SeedDemoData:              envBool("SLACK_AGENT_SEED_DEMO", false),
-		AutoAdvance:               envBool("SLACK_AGENT_AUTO_ADVANCE", true),
 		SlackBotToken:             os.Getenv("SLACK_BOT_TOKEN"),
 		SlackUserToken:            os.Getenv("SLACK_USER_TOKEN"),
 		SlackUserID:               os.Getenv("SLACK_USER_ID"),
 		SlackUserSearchName:       os.Getenv("SLACK_AGENT_USER_SEARCH_NAME"),
 		SlackIncludeParticipated:  envBool("SLACK_AGENT_INCLUDE_USER_PARTICIPATED", false),
+		SlackSyncIntervalSeconds:  envInt("SLACK_AGENT_SYNC_INTERVAL_SECONDS", 300),
 		CodexBin:                  env("SLACK_AGENT_CODEX_BIN", "/Applications/Codex.app/Contents/Resources/codex"),
 		CodexPermissionProfile:    envAllowEmpty("SLACK_AGENT_CODEX_PERMISSION_PROFILE", ":workspace"),
 		CodexSandboxMode:          envAllowEmpty("SLACK_AGENT_CODEX_SANDBOX", "workspace-write"),
@@ -60,7 +60,7 @@ func LoadConfig() Config {
 		WorkerConcurrency:         envInt("SLACK_AGENT_WORKER_CONCURRENCY", 2),
 		SlackSearchPageSize:       envInt("SLACK_AGENT_SEARCH_PAGE_SIZE", 100),
 		SlackSearchMaxPages:       envInt("SLACK_AGENT_SEARCH_MAX_PAGES", 20),
-		SlackSearchLookbackDays:   envInt("SLACK_AGENT_SEARCH_LOOKBACK_DAYS", 14),
+		SlackSearchLookbackDays:   envInt("SLACK_AGENT_SEARCH_LOOKBACK_DAYS", 3),
 		SlackDMChannelLimit:       envInt("SLACK_AGENT_DM_CHANNEL_LIMIT", 0),
 		SlackDMHistoryPageSize:    envInt("SLACK_AGENT_DM_HISTORY_PAGE_SIZE", 100),
 		SlackDMHistoryMaxPages:    envInt("SLACK_AGENT_DM_HISTORY_MAX_PAGES", 10),

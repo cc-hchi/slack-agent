@@ -21,6 +21,34 @@ type Store struct {
 	cfg Config
 }
 
+const intakeTriggerSelect = `
+		       COALESCE(
+		         (
+		           SELECT COALESCE(
+		             NULLIF(CASE WHEN LENGTH(TRIM(COALESCE(su.display_name, ''))) > 1 THEN su.display_name ELSE '' END, ''),
+		             NULLIF(su.real_name, '')
+		           )
+		           FROM slack_users su
+		           WHERE su.user_id = st.trigger_user_id
+		         ),
+		         st.trigger_user_id
+		       ) AS trigger_display_name,
+		       COALESCE(
+		         (
+		           SELECT COALESCE(
+		             NULLIF(CASE WHEN LENGTH(TRIM(COALESCE(su.display_name, ''))) > 1 THEN su.display_name ELSE '' END, ''),
+		             NULLIF(su.real_name, '')
+		           )
+		           FROM slack_users su
+		           WHERE su.user_id = st.trigger_user_id
+		         ),
+		         st.trigger_user_id
+		       ) AS root_display_name,
+		       st.trigger_user_id,
+		       st.trigger_user_id AS root_user_id,
+		       st.trigger_text,
+		       st.trigger_text AS root_text`
+
 func OpenStore(cfg Config) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(cfg.DatabasePath), 0o755); err != nil {
 		return nil, err
@@ -41,33 +69,80 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) Migrate() error {
+	if err := s.resetLegacySchemaIfNeeded(); err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(schemaSQL); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("slack_threads", "latest_slack_message_ts", "TEXT"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("slack_threads", "last_analyzed_slack_ts", "TEXT"); err != nil {
-		return err
-	}
-	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_slack_threads_latest_ts ON slack_threads(latest_slack_message_ts)"); err != nil {
-		return err
-	}
-	if err := s.backfillSlackThreadActivity(); err != nil {
 		return err
 	}
 	_, err := s.db.Exec(
 		"INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
 		"schema_version",
-		"2",
+		"6",
 	)
 	return err
 }
 
-func (s *Store) ensureColumn(table, column, definition string) error {
+func (s *Store) resetLegacySchemaIfNeeded() error {
+	legacy := false
+	if exists, err := s.tableExists("slack_threads"); err != nil {
+		return err
+	} else if exists {
+		legacy = true
+	}
+	if exists, err := s.tableExists("intake_items"); err != nil {
+		return err
+	} else if exists {
+		hasTriggerTS, err := s.columnExists("intake_items", "trigger_ts")
+		if err != nil {
+			return err
+		}
+		if !hasTriggerTS {
+			legacy = true
+		}
+	}
+	for _, table := range []string{"analysis_runs", "jobs", "reply_drafts"} {
+		exists, err := s.tableExists(table)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		hasColumn, err := s.columnExists(table, "intake_item_id")
+		if err != nil {
+			return err
+		}
+		if !hasColumn {
+			legacy = true
+			break
+		}
+	}
+	if !legacy {
+		return nil
+	}
+	_, err := s.db.Exec(`
+		PRAGMA foreign_keys = OFF;
+		DROP TABLE IF EXISTS reply_drafts;
+		DROP TABLE IF EXISTS worker_artifacts;
+		DROP TABLE IF EXISTS worker_sessions;
+		DROP TABLE IF EXISTS job_events;
+		DROP TABLE IF EXISTS jobs;
+		DROP TABLE IF EXISTS analysis_runs;
+		DROP TABLE IF EXISTS slack_messages;
+		DROP TABLE IF EXISTS slack_threads;
+		DROP TABLE IF EXISTS intake_items;
+		DROP TABLE IF EXISTS slack_users;
+		DROP TABLE IF EXISTS health_checks;
+		DROP TABLE IF EXISTS metadata;
+		PRAGMA foreign_keys = ON;`)
+	return err
+}
+
+func (s *Store) columnExists(table, column string) (bool, error) {
 	rows, err := s.db.Query("PRAGMA table_info(" + table + ")")
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer rows.Close()
 	for rows.Next() {
@@ -77,77 +152,27 @@ func (s *Store) ensureColumn(table, column, definition string) error {
 		var defaultValue any
 		var pk int
 		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk); err != nil {
-			return err
+			return false, err
 		}
 		if name == column {
-			return nil
+			return true, nil
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	_, err = s.db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition)
-	return err
+	return false, rows.Err()
 }
 
-func (s *Store) backfillSlackThreadActivity() error {
-	rows, err := s.db.Query(`
-		SELECT st.id,
-		       COALESCE(NULLIF(st.latest_slack_message_ts, ''), (
-		         SELECT MAX(sm.slack_message_ts)
-		         FROM slack_messages sm
-		         WHERE sm.slack_thread_id = st.id
-		       )) AS latest_slack_message_ts
-		FROM slack_threads st`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	type update struct {
-		id         int64
-		latestTS   string
-		activityAt string
-	}
-	var updates []update
-	for rows.Next() {
-		var id int64
-		var latestTS sql.NullString
-		if err := rows.Scan(&id, &latestTS); err != nil {
-			return err
-		}
-		if !latestTS.Valid || strings.TrimSpace(latestTS.String) == "" {
-			continue
-		}
-		parsed, ok := parseSlackTimestamp(latestTS.String)
-		if !ok {
-			continue
-		}
-		updates = append(updates, update{
-			id:         id,
-			latestTS:   latestTS.String,
-			activityAt: parsed.UTC().Format(time.RFC3339),
-		})
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for _, update := range updates {
-		if _, err := s.db.Exec(
-			"UPDATE slack_threads SET latest_slack_message_ts=?, last_slack_activity_at=? WHERE id=?",
-			update.latestTS,
-			update.activityAt,
-			update.id,
-		); err != nil {
-			return err
-		}
-	}
-	return nil
+func (s *Store) tableExists(table string) (bool, error) {
+	var count int
+	err := s.db.QueryRow(
+		"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+		table,
+	).Scan(&count)
+	return count > 0, err
 }
 
 func (s *Store) SeedDemoData() error {
 	var count int
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM slack_threads").Scan(&count); err != nil {
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM intake_items").Scan(&count); err != nil {
 		return err
 	}
 	if count > 0 {
@@ -166,19 +191,22 @@ func (s *Store) SeedDemoData() error {
 		ThreadTS    string
 		SourceType  string
 		Status      string
+		Resolution  string
 		Title       string
 	}{
-		{"C-BACKEND", "#backend", "1764168480.000100", "mention", "job_created", "API error on export"},
-		{"C-PAYMENTS", "#payments", "1764168120.000200", "user_participated", "job_created", "Payment webhook failing"},
-		{"D-PRIYA", "DM with Priya Shah", "1764167600.000300", "dm", "job_created", "S3 upload error on large files"},
+		{"C-BACKEND", "#backend", "1764168480.000100", "mention", "resolved", "job_created", "API error on export"},
+		{"C-PAYMENTS", "#payments", "1764168120.000200", "user_participated", "resolved", "job_created", "Payment webhook failing"},
+		{"D-PRIYA", "DM with Priya Shah", "1764167600.000300", "dm", "resolved", "job_created", "S3 upload error on large files"},
 	}
 	for _, thread := range threads {
+		triggerText := thread.Title + ": can you take a look?"
 		if _, err := tx.Exec(`
-			INSERT INTO slack_threads(
-				slack_team_id, channel_id, channel_name, thread_ts, root_message_ts,
-				source_type, status, title, permalink, last_slack_activity_at,
-				last_synced_at, raw_json
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			INSERT INTO intake_items(
+				slack_team_id, channel_id, channel_name, trigger_ts, thread_ts,
+				source_type, status, resolution, title, permalink, trigger_user_id, trigger_text,
+				latest_slack_message_ts, latest_user_id, latest_user_name,
+				latest_text, last_synced_at, raw_json
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			"T-DEMO",
 			thread.ChannelID,
 			thread.ChannelName,
@@ -186,43 +214,16 @@ func (s *Store) SeedDemoData() error {
 			thread.ThreadTS,
 			thread.SourceType,
 			thread.Status,
+			thread.Resolution,
 			thread.Title,
 			fmt.Sprintf("https://slack.example.local/archives/%s/p%s", thread.ChannelID, strings.ReplaceAll(thread.ThreadTS, ".", "")),
-			now,
-			now,
-			mustJSON(map[string]any{"sample": true}),
-		); err != nil {
-			return err
-		}
-	}
-
-	rows, err := tx.Query("SELECT id, thread_ts, source_type, title FROM slack_threads ORDER BY id")
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id int64
-		var threadTS, sourceType, title string
-		if err := rows.Scan(&id, &threadTS, &sourceType, &title); err != nil {
-			return err
-		}
-		mentions := 0
-		if sourceType == "mention" {
-			mentions = 1
-		}
-		if _, err := tx.Exec(`
-			INSERT INTO slack_messages(
-				slack_thread_id, slack_message_ts, user_id, user_name, text,
-				is_user_message, mentions_user, raw_json
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			id,
-			threadTS,
+			"U-DEMO",
+			triggerText,
+			thread.ThreadTS,
 			"U-DEMO",
 			"Ava K.",
-			title+": can you take a look?",
-			0,
-			mentions,
+			triggerText,
+			now,
 			mustJSON(map[string]any{"sample": true}),
 		); err != nil {
 			return err
@@ -242,7 +243,7 @@ func (s *Store) SeedDemoData() error {
 	for _, run := range analysis {
 		if _, err := tx.Exec(`
 			INSERT INTO analysis_runs(
-				slack_thread_id, codex_thread_id, status, action_required, confidence,
+				intake_item_id, codex_thread_id, status, action_required, confidence,
 				summary, rationale, structured_result_json, started_at, completed_at, error
 			) VALUES (?, NULL, 'completed', 1, ?, ?, ?, ?, ?, ?, NULL)`,
 			run.ThreadID,
@@ -276,7 +277,7 @@ func (s *Store) SeedDemoData() error {
 	for _, job := range jobs {
 		if _, err := tx.Exec(`
 			INSERT INTO jobs(
-				slack_thread_id, analysis_run_id, title, status, urgency, task_type,
+				intake_item_id, analysis_run_id, title, status, urgency, task_type,
 				workspace_path, bootstrap_status, codex_thread_id, current_block_reason,
 				next_user_action, created_at, updated_at
 			) VALUES (?, ?, ?, ?, ?, ?, ?, 'succeeded', ?, ?, ?, ?, ?)`,
@@ -320,7 +321,7 @@ func (s *Store) SeedDemoData() error {
 	}
 	if _, err := tx.Exec(`
 		INSERT INTO reply_drafts(
-			job_id, slack_thread_id, status, draft_text, edited_text, rationale,
+			job_id, intake_item_id, status, draft_text, edited_text, rationale,
 			slack_channel_id, slack_thread_ts, slack_message_ts, sent_permalink,
 			created_at, updated_at
 		) VALUES (?, ?, 'draft', ?, NULL, ?, ?, ?, NULL, NULL, ?, ?)`,
@@ -342,38 +343,12 @@ func (s *Store) DashboardSnapshot() (DashboardSnapshot, error) {
 	replyDrafts, err := s.queryMaps(`
 		SELECT rd.*, j.title AS job_title, j.status AS job_status,
 		       st.title AS thread_title, st.channel_name, st.channel_id, st.source_type,
-		       st.thread_ts, st.permalink, st.last_slack_activity_at,
+		       st.trigger_ts, st.thread_ts, st.permalink, st.latest_slack_message_ts,
 		       ar.confidence, ar.summary AS analyzer_summary, ar.rationale AS analyzer_rationale,
-		       (
-		         SELECT COALESCE(
-		           NULLIF(CASE WHEN LENGTH(TRIM(COALESCE(su.display_name, ''))) > 1 THEN su.display_name ELSE '' END, ''),
-		           NULLIF(su.real_name, ''),
-		           NULLIF(sm.user_name, ''),
-		           sm.user_id
-		         )
-		         FROM slack_messages sm
-		         LEFT JOIN slack_users su ON su.user_id = sm.user_id
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_user_name,
-		       (
-		         SELECT sm.user_id
-		         FROM slack_messages sm
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_user_id,
-		       (
-		         SELECT sm.text
-		         FROM slack_messages sm
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_text
+` + intakeTriggerSelect + `
 		FROM reply_drafts rd
 		LEFT JOIN jobs j ON j.id = rd.job_id
-		LEFT JOIN slack_threads st ON st.id = rd.slack_thread_id
+		LEFT JOIN intake_items st ON st.id = rd.intake_item_id
 		LEFT JOIN analysis_runs ar ON ar.id = j.analysis_run_id
 		WHERE rd.status IN ('draft', 'edited', 'send_failed')
 		ORDER BY rd.updated_at DESC`)
@@ -382,119 +357,21 @@ func (s *Store) DashboardSnapshot() (DashboardSnapshot, error) {
 	}
 	blocked, err := s.queryMaps(`
 		SELECT 'job' AS item_type, j.*, st.channel_name, st.channel_id, st.source_type,
-		       st.thread_ts, st.permalink, st.title AS thread_title, st.last_slack_activity_at,
-		       (
-		         SELECT COALESCE(
-		           NULLIF(CASE WHEN LENGTH(TRIM(COALESCE(su.display_name, ''))) > 1 THEN su.display_name ELSE '' END, ''),
-		           NULLIF(su.real_name, ''),
-		           NULLIF(sm.user_name, ''),
-		           sm.user_id
-		         )
-		         FROM slack_messages sm
-		         LEFT JOIN slack_users su ON su.user_id = sm.user_id
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_user_name,
-		       (
-		         SELECT sm.user_id
-		         FROM slack_messages sm
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_user_id,
-		       (
-		         SELECT sm.text
-		         FROM slack_messages sm
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_text
+		       st.trigger_ts, st.thread_ts, st.permalink, st.title AS thread_title, st.latest_slack_message_ts,
+` + intakeTriggerSelect + `
 		FROM jobs j
-		JOIN slack_threads st ON st.id = j.slack_thread_id
+		JOIN intake_items st ON st.id = j.intake_item_id
 		WHERE j.status IN ('blocked', 'failed')
 		ORDER BY j.updated_at DESC`)
 	if err != nil {
 		return DashboardSnapshot{}, err
 	}
-	analysisFailures, err := s.queryMaps(`
-			SELECT 'thread' AS item_type, st.id, st.id AS slack_thread_id, st.title,
-			       st.status, st.channel_name, st.channel_id, st.thread_ts, st.source_type, st.permalink,
-			       st.last_synced_at AS updated_at,
-			       COALESCE(ar.error, 'Analyzer failed') AS current_block_reason,
-			       'Retry analysis after reviewing the analyzer failure.' AS next_user_action,
-			       (
-			         SELECT COALESCE(
-			           NULLIF(CASE WHEN LENGTH(TRIM(COALESCE(su.display_name, ''))) > 1 THEN su.display_name ELSE '' END, ''),
-			           NULLIF(su.real_name, ''),
-			           NULLIF(sm.user_name, ''),
-			           sm.user_id
-			         )
-			         FROM slack_messages sm
-			         LEFT JOIN slack_users su ON su.user_id = sm.user_id
-			         WHERE sm.slack_thread_id = st.id
-			         ORDER BY sm.slack_message_ts
-			         LIMIT 1
-			       ) AS root_user_name,
-			       (
-			         SELECT sm.user_id
-			         FROM slack_messages sm
-			         WHERE sm.slack_thread_id = st.id
-			         ORDER BY sm.slack_message_ts
-			         LIMIT 1
-			       ) AS root_user_id,
-			       (
-			         SELECT sm.text
-			         FROM slack_messages sm
-			         WHERE sm.slack_thread_id = st.id
-			         ORDER BY sm.slack_message_ts
-			         LIMIT 1
-			       ) AS root_text
-			FROM slack_threads st
-			LEFT JOIN analysis_runs ar ON ar.id = (
-				SELECT id FROM analysis_runs
-			WHERE slack_thread_id = st.id
-			ORDER BY id DESC
-			LIMIT 1
-		)
-			WHERE st.status = 'analysis_failed'
-			ORDER BY st.last_synced_at DESC`)
-	if err != nil {
-		return DashboardSnapshot{}, err
-	}
-	blocked = append(blocked, analysisFailures...)
 	queued, err := s.queryMaps(`
-			SELECT j.*, st.channel_name, st.channel_id, st.thread_ts, st.source_type, st.permalink,
-			       st.title AS thread_title, st.last_slack_activity_at,
-			       (
-			         SELECT COALESCE(
-			           NULLIF(CASE WHEN LENGTH(TRIM(COALESCE(su.display_name, ''))) > 1 THEN su.display_name ELSE '' END, ''),
-			           NULLIF(su.real_name, ''),
-			           NULLIF(sm.user_name, ''),
-			           sm.user_id
-			         )
-			         FROM slack_messages sm
-			         LEFT JOIN slack_users su ON su.user_id = sm.user_id
-			         WHERE sm.slack_thread_id = st.id
-			         ORDER BY sm.slack_message_ts
-			         LIMIT 1
-			       ) AS root_user_name,
-			       (
-			         SELECT sm.user_id
-			         FROM slack_messages sm
-			         WHERE sm.slack_thread_id = st.id
-			         ORDER BY sm.slack_message_ts
-			         LIMIT 1
-			       ) AS root_user_id,
-			       (
-			         SELECT sm.text
-			         FROM slack_messages sm
-			         WHERE sm.slack_thread_id = st.id
-			         ORDER BY sm.slack_message_ts
-			         LIMIT 1
-			       ) AS root_text
+			SELECT j.*, st.channel_name, st.channel_id, st.trigger_ts, st.thread_ts, st.source_type, st.permalink,
+			       st.title AS thread_title, st.latest_slack_message_ts,
+` + intakeTriggerSelect + `
 			FROM jobs j
-			JOIN slack_threads st ON st.id = j.slack_thread_id
+			JOIN intake_items st ON st.id = j.intake_item_id
 			WHERE j.status = 'queued'
 			ORDER BY j.updated_at DESC`)
 	if err != nil {
@@ -502,168 +379,65 @@ func (s *Store) DashboardSnapshot() (DashboardSnapshot, error) {
 	}
 	intake, err := s.queryMaps(`
 		SELECT st.*, ar.confidence, ar.summary AS analyzer_summary,
-		       (
-		         SELECT COALESCE(
-		           NULLIF(CASE WHEN LENGTH(TRIM(COALESCE(su.display_name, ''))) > 1 THEN su.display_name ELSE '' END, ''),
-		           NULLIF(su.real_name, ''),
-		           NULLIF(sm.user_name, ''),
-		           sm.user_id
-		         )
-		         FROM slack_messages sm
-		         LEFT JOIN slack_users su ON su.user_id = sm.user_id
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_user_name,
-		       (
-		         SELECT sm.user_id
-		         FROM slack_messages sm
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_user_id,
-		       (
-		         SELECT sm.text
-		         FROM slack_messages sm
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_text
-			FROM slack_threads st
+` + intakeTriggerSelect + `
+			FROM intake_items st
 			LEFT JOIN analysis_runs ar ON ar.id = (
 				SELECT id FROM analysis_runs
-				WHERE slack_thread_id = st.id
+				WHERE intake_item_id = st.id
 				ORDER BY id DESC
 				LIMIT 1
 			)
-			WHERE st.status IN ('collected', 'analysis_queued', 'analyzing')
-			ORDER BY st.last_slack_activity_at DESC
+			WHERE st.status = 'pending'
+			ORDER BY COALESCE(st.latest_slack_message_ts, st.trigger_ts) DESC
 			LIMIT 80`)
 	if err != nil {
 		return DashboardSnapshot{}, err
 	}
 	archive, err := s.queryMaps(`
 		SELECT st.*, ar.confidence, ar.summary AS analyzer_summary,
-		       (
-		         SELECT COALESCE(
-		           NULLIF(CASE WHEN LENGTH(TRIM(COALESCE(su.display_name, ''))) > 1 THEN su.display_name ELSE '' END, ''),
-		           NULLIF(su.real_name, ''),
-		           NULLIF(sm.user_name, ''),
-		           sm.user_id
-		         )
-		         FROM slack_messages sm
-		         LEFT JOIN slack_users su ON su.user_id = sm.user_id
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_user_name,
-		       (
-		         SELECT sm.user_id
-		         FROM slack_messages sm
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_user_id,
-		       (
-		         SELECT sm.text
-		         FROM slack_messages sm
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_text
-			FROM slack_threads st
+` + intakeTriggerSelect + `
+			FROM intake_items st
 			LEFT JOIN analysis_runs ar ON ar.id = (
 				SELECT id FROM analysis_runs
-				WHERE slack_thread_id = st.id
+				WHERE intake_item_id = st.id
 				ORDER BY id DESC
 				LIMIT 1
 			)
-		WHERE st.status IN ('no_action', 'archived')
-		ORDER BY st.last_slack_activity_at DESC
+		WHERE st.status = 'resolved'
+		  AND COALESCE(st.resolution, '') != 'job_created'
+		ORDER BY COALESCE(st.latest_slack_message_ts, st.trigger_ts) DESC
 		LIMIT 80`)
 	if err != nil {
 		return DashboardSnapshot{}, err
 	}
 	threads, err := s.queryMaps(`
 		SELECT st.*, ar.confidence, ar.summary AS analyzer_summary,
-		       (
-		         SELECT COALESCE(
-		           NULLIF(CASE WHEN LENGTH(TRIM(COALESCE(su.display_name, ''))) > 1 THEN su.display_name ELSE '' END, ''),
-		           NULLIF(su.real_name, ''),
-		           NULLIF(sm.user_name, ''),
-		           sm.user_id
-		         )
-		         FROM slack_messages sm
-		         LEFT JOIN slack_users su ON su.user_id = sm.user_id
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_user_name,
-		       (
-		         SELECT sm.user_id
-		         FROM slack_messages sm
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_user_id,
-		       (
-		         SELECT sm.text
-		         FROM slack_messages sm
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_text
-			FROM slack_threads st
+` + intakeTriggerSelect + `
+			FROM intake_items st
 			LEFT JOIN analysis_runs ar ON ar.id = (
 				SELECT id FROM analysis_runs
-				WHERE slack_thread_id = st.id
+				WHERE intake_item_id = st.id
 				ORDER BY id DESC
 				LIMIT 1
 			)
-		ORDER BY st.last_slack_activity_at DESC
+		ORDER BY COALESCE(st.latest_slack_message_ts, st.trigger_ts) DESC
 		LIMIT 50`)
 	if err != nil {
 		return DashboardSnapshot{}, err
 	}
 	jobs, err := s.queryMaps(`
-			SELECT j.*, st.channel_name, st.channel_id, st.thread_ts, st.source_type, st.permalink,
-			       st.title AS thread_title, st.last_slack_activity_at,
-			       (
-			         SELECT COALESCE(
-			           NULLIF(CASE WHEN LENGTH(TRIM(COALESCE(su.display_name, ''))) > 1 THEN su.display_name ELSE '' END, ''),
-			           NULLIF(su.real_name, ''),
-			           NULLIF(sm.user_name, ''),
-			           sm.user_id
-			         )
-			         FROM slack_messages sm
-			         LEFT JOIN slack_users su ON su.user_id = sm.user_id
-			         WHERE sm.slack_thread_id = st.id
-			         ORDER BY sm.slack_message_ts
-			         LIMIT 1
-			       ) AS root_user_name,
-			       (
-			         SELECT sm.user_id
-			         FROM slack_messages sm
-			         WHERE sm.slack_thread_id = st.id
-			         ORDER BY sm.slack_message_ts
-			         LIMIT 1
-			       ) AS root_user_id,
-			       (
-			         SELECT sm.text
-			         FROM slack_messages sm
-			         WHERE sm.slack_thread_id = st.id
-			         ORDER BY sm.slack_message_ts
-			         LIMIT 1
-			       ) AS root_text
+			SELECT j.*, st.channel_name, st.channel_id, st.trigger_ts, st.thread_ts, st.source_type, st.permalink,
+			       st.title AS thread_title, st.latest_slack_message_ts,
+` + intakeTriggerSelect + `
 			FROM jobs j
-			JOIN slack_threads st ON st.id = j.slack_thread_id
+			JOIN intake_items st ON st.id = j.intake_item_id
 			ORDER BY j.updated_at DESC
 		LIMIT 50`)
 	if err != nil {
 		return DashboardSnapshot{}, err
 	}
 	events, err := s.queryMaps(`
-		SELECT je.*, j.title AS job_title
+		SELECT je.id, je.job_id, je.event_type, je.message, je.created_at, j.title AS job_title
 		FROM job_events je
 		JOIN jobs j ON j.id = je.job_id
 		ORDER BY je.created_at DESC
@@ -682,14 +456,14 @@ func (s *Store) DashboardSnapshot() (DashboardSnapshot, error) {
 		return DashboardSnapshot{}, err
 	}
 	totalThreads := 0
-	_ = s.db.QueryRow("SELECT COUNT(*) FROM slack_threads").Scan(&totalThreads)
+	_ = s.db.QueryRow("SELECT COUNT(*) FROM intake_items").Scan(&totalThreads)
 	totalIntake := 0
 	_ = s.db.QueryRow(`
 		SELECT COUNT(*)
-		FROM slack_threads st
-			WHERE st.status IN ('collected', 'analysis_queued', 'analyzing')`).Scan(&totalIntake)
+		FROM intake_items st
+			WHERE st.status = 'pending'`).Scan(&totalIntake)
 	totalArchive := 0
-	_ = s.db.QueryRow("SELECT COUNT(*) FROM slack_threads WHERE status IN ('no_action', 'archived')").Scan(&totalArchive)
+	_ = s.db.QueryRow("SELECT COUNT(*) FROM intake_items WHERE status = 'resolved' AND COALESCE(resolution, '') != 'job_created'").Scan(&totalArchive)
 	return DashboardSnapshot{
 		ReplyDrafts: replyDrafts,
 		Blocked:     blocked,
@@ -759,36 +533,10 @@ func (s *Store) jobsByIDs(ids []int64) ([]map[string]any, error) {
 	}
 	return s.queryMaps(`
 		SELECT j.*, st.channel_name, st.channel_id, st.source_type, st.permalink,
-		       st.thread_ts, st.title AS thread_title, st.last_slack_activity_at,
-		       (
-		         SELECT COALESCE(
-		           NULLIF(CASE WHEN LENGTH(TRIM(COALESCE(su.display_name, ''))) > 1 THEN su.display_name ELSE '' END, ''),
-		           NULLIF(su.real_name, ''),
-		           NULLIF(sm.user_name, ''),
-		           sm.user_id
-		         )
-		         FROM slack_messages sm
-		         LEFT JOIN slack_users su ON su.user_id = sm.user_id
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_user_name,
-		       (
-		         SELECT sm.user_id
-		         FROM slack_messages sm
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_user_id,
-		       (
-		         SELECT sm.text
-		         FROM slack_messages sm
-		         WHERE sm.slack_thread_id = st.id
-		         ORDER BY sm.slack_message_ts
-		         LIMIT 1
-		       ) AS root_text
+		       st.trigger_ts, st.thread_ts, st.title AS thread_title, st.latest_slack_message_ts,
+`+intakeTriggerSelect+`
 		FROM jobs j
-		JOIN slack_threads st ON st.id = j.slack_thread_id
+		JOIN intake_items st ON st.id = j.intake_item_id
 		WHERE j.id IN (`+strings.Join(placeholders, ",")+`)
 		ORDER BY j.updated_at DESC`, args...)
 }

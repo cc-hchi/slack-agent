@@ -15,16 +15,18 @@ import (
 )
 
 type Service struct {
-	cfg            Config
-	store          *Store
-	analyses       chan int64
-	jobs           chan int64
-	autoAdvance    chan struct{}
-	analysisMu     sync.Mutex
-	queuedAnalyses map[int64]struct{}
-	jobsMu         sync.Mutex
-	queuedJobs     map[int64]struct{}
-	workingJobs    map[int64]struct{}
+	cfg             Config
+	store           *Store
+	slackSyncMu     sync.Mutex
+	analyses        chan int64
+	jobs            chan int64
+	analysisAdvance chan struct{}
+	jobAdvance      chan struct{}
+	analysisMu      sync.Mutex
+	activeAnalyses  map[int64]struct{}
+	jobsMu          sync.Mutex
+	queuedJobs      map[int64]struct{}
+	workingJobs     map[int64]struct{}
 }
 
 type threadCollectResult struct {
@@ -42,15 +44,17 @@ func NewService(cfg Config, store *Store) *Service {
 		workers = 1
 	}
 	service := &Service{
-		cfg:            cfg,
-		store:          store,
-		analyses:       make(chan int64, 100),
-		jobs:           make(chan int64, 100),
-		autoAdvance:    make(chan struct{}, 1),
-		queuedAnalyses: make(map[int64]struct{}),
-		queuedJobs:     make(map[int64]struct{}),
-		workingJobs:    make(map[int64]struct{}),
+		cfg:             cfg,
+		store:           store,
+		analyses:        make(chan int64, 100),
+		jobs:            make(chan int64, 100),
+		analysisAdvance: make(chan struct{}, 1),
+		jobAdvance:      make(chan struct{}, 1),
+		activeAnalyses:  make(map[int64]struct{}),
+		queuedJobs:      make(map[int64]struct{}),
+		workingJobs:     make(map[int64]struct{}),
 	}
+	service.recoverInterruptedWorkerSessions()
 	service.recoverInterruptedJobs()
 	for i := 0; i < analyzers; i++ {
 		go service.analyzerLoop()
@@ -58,10 +62,10 @@ func NewService(cfg Config, store *Store) *Service {
 	for i := 0; i < workers; i++ {
 		go service.workerLoop()
 	}
-	if cfg.AutoAdvance {
-		go service.autoAdvanceLoop()
-		service.signalAutoAdvance()
-	}
+	go service.analysisSchedulerLoop()
+	go service.jobSchedulerLoop()
+	go service.slackSyncSchedulerLoop()
+	service.signalAutoAdvance()
 	return service
 }
 
@@ -163,9 +167,23 @@ func (s *Service) probeCodex(bin string) (map[string]any, error) {
 }
 
 func (s *Service) SyncSlack() (map[string]any, error) {
+	if !s.slackSyncMu.TryLock() {
+		return map[string]any{
+			"collected":    0,
+			"skipped":      0,
+			"errors":       []string{},
+			"reason":       "sync_already_running",
+			"sync_skipped": true,
+			"synced_at":    utcNow(),
+		}, nil
+	}
+	defer s.slackSyncMu.Unlock()
+	_ = s.store.setMetadata("slack_sync.last_started_at", utcNow())
+
 	client := NewSlackClient(s.cfg)
 	auth, err := client.AuthTest()
 	if err != nil {
+		s.recordSlackSyncResult(nil, err)
 		return nil, err
 	}
 	userID := s.cfg.SlackUserID
@@ -179,7 +197,8 @@ func (s *Service) SyncSlack() (map[string]any, error) {
 	collected := 0
 	skipped := 0
 	errors := []string{}
-	seenThreads := map[string]struct{}{}
+	seenIntakes := map[string]struct{}{}
+	defaultCursorNow := time.Now()
 	queries := []struct {
 		Query  string
 		Source string
@@ -200,12 +219,14 @@ func (s *Service) SyncSlack() (map[string]any, error) {
 	}
 	for _, query := range queries {
 		cursorKey := fmt.Sprintf("slack_sync.search.%s.latest_ts", query.Source)
-		lastSeenTS := s.store.metadata(cursorKey)
+		storedCursor := s.store.metadata(cursorKey)
+		lastSeenTS := slackCursorOrNow(storedCursor, defaultCursorNow)
 		searchQuery := query.Query
 		if after := slackSearchAfterDate(lastSeenTS, s.cfg.SlackSearchLookbackDays); after != "" {
 			searchQuery += " after:" + after
 		}
 		maxSeenTS := lastSeenTS
+		searchChecked := false
 		pageSize := positiveInt(s.cfg.SlackSearchPageSize, 100)
 		for page := 1; shouldFetchPage(page, s.cfg.SlackSearchMaxPages); page++ {
 			matches, pageInfo, err := client.SearchMessages(searchQuery, pageSize, page)
@@ -213,6 +234,7 @@ func (s *Service) SyncSlack() (map[string]any, error) {
 				errors = append(errors, err.Error())
 				break
 			}
+			searchChecked = true
 			if len(matches) == 0 {
 				break
 			}
@@ -220,7 +242,7 @@ func (s *Service) SyncSlack() (map[string]any, error) {
 				if ts := slackMessageTS(match); slackTSAfter(ts, maxSeenTS) {
 					maxSeenTS = ts
 				}
-				result, err := s.collectThreadFromMessage(client, teamID, "", "", query.Source, match, userID, seenThreads)
+				result, err := s.collectThreadFromMessage(client, teamID, "", "", query.Source, match, userID, seenIntakes)
 				if err != nil {
 					errors = append(errors, err.Error())
 					continue
@@ -239,7 +261,7 @@ func (s *Service) SyncSlack() (map[string]any, error) {
 				break
 			}
 		}
-		if slackTSAfter(maxSeenTS, lastSeenTS) {
+		if searchChecked && (storedCursor == "" || slackTSAfter(maxSeenTS, storedCursor)) {
 			if err := s.store.setMetadata(cursorKey, maxSeenTS); err != nil {
 				errors = append(errors, "search cursor "+query.Source+": "+err.Error())
 			}
@@ -258,7 +280,8 @@ func (s *Service) SyncSlack() (map[string]any, error) {
 				continue
 			}
 			cursorKey := fmt.Sprintf("slack_sync.dm.%s.latest_ts", channelID)
-			lastSeenTS := s.store.metadata(cursorKey)
+			storedCursor := s.store.metadata(cursorKey)
+			lastSeenTS := slackCursorOrNow(storedCursor, defaultCursorNow)
 			oldest := slackOldestFromCursor(lastSeenTS, s.cfg.SlackSearchLookbackDays)
 			history, err := client.ConversationsHistory(
 				channelID,
@@ -278,7 +301,7 @@ func (s *Service) SyncSlack() (map[string]any, error) {
 				if msgUser, _ := message["user"].(string); msgUser == userID {
 					continue
 				}
-				result, err := s.collectThreadFromMessage(client, teamID, channelID, "DM", "dm", message, userID, seenThreads)
+				result, err := s.collectThreadFromMessage(client, teamID, channelID, "DM", "dm", message, userID, seenIntakes)
 				if err != nil {
 					errors = append(errors, err.Error())
 					continue
@@ -290,7 +313,7 @@ func (s *Service) SyncSlack() (map[string]any, error) {
 					skipped++
 				}
 			}
-			if slackTSAfter(maxSeenTS, lastSeenTS) {
+			if storedCursor == "" || slackTSAfter(maxSeenTS, storedCursor) {
 				if err := s.store.setMetadata(cursorKey, maxSeenTS); err != nil {
 					errors = append(errors, "dm cursor "+channelID+": "+err.Error())
 				}
@@ -299,13 +322,51 @@ func (s *Service) SyncSlack() (map[string]any, error) {
 	}
 	errors = append(errors, s.resolveSlackUsers(client, 120)...)
 	s.signalAutoAdvance()
-	return map[string]any{
-		"collected":    collected,
-		"skipped":      skipped,
-		"errors":       errors,
-		"synced_at":    utcNow(),
-		"auto_advance": s.cfg.AutoAdvance,
-	}, nil
+	result := map[string]any{
+		"collected": collected,
+		"skipped":   skipped,
+		"errors":    errors,
+		"synced_at": utcNow(),
+	}
+	s.recordSlackSyncResult(result, nil)
+	return result, nil
+}
+
+func (s *Service) slackSyncSchedulerLoop() {
+	initialDelay := 5 * time.Second
+	timer := time.NewTimer(initialDelay)
+	defer timer.Stop()
+	for {
+		<-timer.C
+		_, _ = s.SyncSlack()
+		timer.Reset(s.slackSyncInterval())
+	}
+}
+
+func (s *Service) slackSyncInterval() time.Duration {
+	seconds := s.cfg.SlackSyncIntervalSeconds
+	if seconds <= 0 {
+		seconds = 300
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (s *Service) recordSlackSyncResult(result map[string]any, syncErr error) {
+	finishedAt := utcNow()
+	_ = s.store.setMetadata("slack_sync.last_finished_at", finishedAt)
+	if syncErr != nil {
+		_ = s.store.setMetadata("slack_sync.last_error", syncErr.Error())
+		return
+	}
+	if result == nil {
+		return
+	}
+	_ = s.store.setMetadata("slack_sync.last_result", mustJSON(result))
+	if errors, ok := result["errors"].([]string); ok && len(errors) > 0 {
+		_ = s.store.setMetadata("slack_sync.last_error", strings.Join(errors, "; "))
+		return
+	}
+	_ = s.store.setMetadata("slack_sync.last_error", "")
 }
 
 func (s *Service) collectThreadFromMessage(client *SlackClient, teamID, fallbackChannelID, fallbackChannelName, sourceType string, match map[string]any, userID string, seen map[string]struct{}) (threadCollectResult, error) {
@@ -317,16 +378,20 @@ func (s *Service) collectThreadFromMessage(client *SlackClient, teamID, fallback
 		channelName = fallbackChannelName
 	}
 	threadTS := slackThreadTS(match)
-	if channelID == "" || threadTS == "" {
+	triggerTS := slackMessageTS(match)
+	if triggerTS == "" {
+		triggerTS = threadTS
+	}
+	if channelID == "" || threadTS == "" || triggerTS == "" {
 		return threadCollectResult{skipped: true}, nil
 	}
-	key := slackThreadKey(teamID, channelID, threadTS)
+	key := slackThreadKey(teamID, channelID, triggerTS)
 	if _, exists := seen[key]; exists {
 		return threadCollectResult{skipped: true}, nil
 	}
 	seen[key] = struct{}{}
 
-	if latestTS, ok := candidateThreadLatestTS(match); ok && s.threadKnownUpToDate(teamID, channelID, threadTS, latestTS) {
+	if latestTS, ok := candidateThreadLatestTS(match); ok && s.intakeKnownUpToDate(teamID, channelID, triggerTS, latestTS) {
 		return threadCollectResult{skipped: true}, nil
 	}
 
@@ -339,37 +404,29 @@ func (s *Service) collectThreadFromMessage(client *SlackClient, teamID, fallback
 	if err != nil || len(messages) == 0 {
 		messages = []map[string]any{match}
 	}
-	root := match
-	if len(messages) > 0 {
-		root = messages[0]
-	}
-	if firstString(root["permalink"]) == "" {
-		if permalink, err := client.ChatGetPermalink(channelID, threadTS); err == nil {
-			root["permalink"] = permalink
+	if firstString(match["permalink"]) == "" {
+		if permalink, err := client.ChatGetPermalink(channelID, triggerTS); err == nil {
+			match["permalink"] = permalink
 		}
 	}
-	if err := s.upsertThread(teamID, channelID, channelName, threadTS, sourceType, root, messages, userID); err != nil {
+	if err := s.upsertIntakeItem(teamID, channelID, channelName, triggerTS, threadTS, sourceType, match, messages, userID); err != nil {
 		return threadCollectResult{}, err
 	}
 	return threadCollectResult{collected: true}, nil
 }
 
-func (s *Service) threadKnownUpToDate(teamID, channelID, threadTS, latestTS string) bool {
+func (s *Service) intakeKnownUpToDate(teamID, channelID, triggerTS, latestTS string) bool {
 	if latestTS == "" {
 		return false
 	}
 	var storedLatest sql.NullString
 	err := s.store.db.QueryRow(`
-		SELECT COALESCE(st.latest_slack_message_ts, (
-		         SELECT MAX(sm.slack_message_ts)
-		         FROM slack_messages sm
-		         WHERE sm.slack_thread_id = st.id
-		       )) AS latest_slack_message_ts
-		FROM slack_threads st
-		WHERE st.slack_team_id=? AND st.channel_id=? AND st.thread_ts=?`,
+		SELECT latest_slack_message_ts
+		FROM intake_items
+		WHERE slack_team_id=? AND channel_id=? AND trigger_ts=?`,
 		teamID,
 		channelID,
-		threadTS,
+		triggerTS,
 	).Scan(&storedLatest)
 	if err != nil || !storedLatest.Valid || storedLatest.String == "" {
 		return false
@@ -379,13 +436,17 @@ func (s *Service) threadKnownUpToDate(teamID, channelID, threadTS, latestTS stri
 
 func (s *Service) resolveSlackUsers(client *SlackClient, limit int) []string {
 	rows, err := s.store.db.Query(`
-		SELECT DISTINCT sm.user_id
-		FROM slack_messages sm
-		LEFT JOIN slack_users su ON su.user_id = sm.user_id
-		WHERE sm.user_id IS NOT NULL
-		  AND sm.user_id != ''
+		SELECT DISTINCT ids.user_id
+		FROM (
+			SELECT trigger_user_id AS user_id FROM intake_items
+			UNION
+			SELECT latest_user_id AS user_id FROM intake_items
+		) ids
+		LEFT JOIN slack_users su ON su.user_id = ids.user_id
+		WHERE ids.user_id IS NOT NULL
+		  AND ids.user_id != ''
 		  AND (su.user_id IS NULL OR COALESCE(su.display_name, '') = '')
-		ORDER BY sm.user_id
+		ORDER BY ids.user_id
 		LIMIT ?`, limit)
 	if err != nil {
 		return []string{"user cache query: " + err.Error()}
@@ -437,9 +498,16 @@ func (s *Service) resolveSlackUsers(client *SlackClient, limit int) []string {
 			errors = append(errors, "user cache upsert "+userID+": "+err.Error())
 			continue
 		}
-		_, _ = s.store.db.Exec(
-			"UPDATE slack_messages SET user_name=? WHERE user_id=? AND COALESCE(user_name, '') = ''",
+		_, _ = s.store.db.Exec(`
+			UPDATE intake_items
+			SET latest_user_name = CASE
+			      WHEN latest_user_id = ? AND (COALESCE(latest_user_name, '') = '' OR latest_user_name = latest_user_id) THEN ?
+			      ELSE latest_user_name
+			    END
+			WHERE trigger_user_id = ? OR latest_user_id = ?`,
+			userID,
 			displayName,
+			userID,
 			userID,
 		)
 	}
@@ -541,14 +609,24 @@ func candidateThreadLatestTS(message map[string]any) (string, bool) {
 	return ts, ts != ""
 }
 
-func latestSlackMessageTS(messages []map[string]any) string {
-	latest := ""
+func latestSlackMessage(messages []map[string]any) map[string]any {
+	var latest map[string]any
+	latestTS := ""
 	for _, message := range messages {
-		if ts := slackMessageTS(message); slackTSAfter(ts, latest) {
-			latest = ts
+		if ts := slackMessageTS(message); slackTSAfter(ts, latestTS) {
+			latestTS = ts
+			latest = message
 		}
 	}
 	return latest
+}
+
+func slackMessageUserName(message map[string]any) string {
+	return firstString(message["username"], message["user_name"])
+}
+
+func slackMessageText(message map[string]any) string {
+	return firstString(message["text"])
 }
 
 func latestSlackTSFromThread(thread map[string]any) string {
@@ -563,7 +641,7 @@ func latestSlackTSFromThread(thread map[string]any) string {
 
 func shouldRecollectThread(status string) bool {
 	switch status {
-	case "collected", "analysis_queued", "analyzing":
+	case "pending":
 		return false
 	default:
 		return true
@@ -585,34 +663,39 @@ func slackTSAfter(left, right string) bool {
 	return left > right
 }
 
-func slackTimestampToUTC(ts string) string {
-	parsed, ok := parseSlackTimestamp(ts)
-	if !ok {
-		return utcNow()
-	}
-	return parsed.UTC().Format(time.RFC3339)
-}
-
 func slackSearchAfterDate(cursor string, lookbackDays int) string {
-	if cursor == "" || lookbackDays <= 0 {
+	if cursor == "" {
 		return ""
 	}
 	parsed, ok := parseSlackTimestamp(cursor)
 	if !ok {
 		return ""
 	}
-	return parsed.AddDate(0, 0, -lookbackDays).UTC().Format("2006-01-02")
+	if lookbackDays > 0 {
+		parsed = parsed.AddDate(0, 0, -lookbackDays)
+	}
+	return parsed.UTC().Format("2006-01-02")
 }
 
 func slackOldestFromCursor(cursor string, lookbackDays int) string {
-	if cursor == "" || lookbackDays <= 0 {
+	if cursor == "" {
 		return ""
 	}
 	parsed, ok := parseSlackTimestamp(cursor)
 	if !ok {
 		return ""
 	}
-	return formatSlackTimestamp(parsed.AddDate(0, 0, -lookbackDays))
+	if lookbackDays > 0 {
+		parsed = parsed.AddDate(0, 0, -lookbackDays)
+	}
+	return formatSlackTimestamp(parsed)
+}
+
+func slackCursorOrNow(cursor string, now time.Time) string {
+	if cursor != "" {
+		return cursor
+	}
+	return formatSlackTimestamp(now)
 }
 
 func parseSlackTimestamp(ts string) (time.Time, bool) {
@@ -643,27 +726,29 @@ func formatSlackTimestamp(value time.Time) string {
 	return fmt.Sprintf("%d.%06d", utc.Unix(), utc.Nanosecond()/1000)
 }
 
-func (s *Service) upsertThread(teamID, channelID, channelName, threadTS, sourceType string, root map[string]any, messages []map[string]any, userID string) error {
-	title, _ := root["text"].(string)
+func (s *Service) upsertIntakeItem(teamID, channelID, channelName, triggerTS, threadTS, sourceType string, trigger map[string]any, messages []map[string]any, userID string) error {
+	if len(messages) == 0 {
+		messages = []map[string]any{trigger}
+	}
+	latest := latestSlackMessage(messages)
+	if latest == nil {
+		latest = trigger
+	}
+
+	title := slackMessageText(trigger)
 	title = strings.TrimSpace(strings.ReplaceAll(title, "\n", " "))
 	if len(title) > 90 {
 		title = title[:90]
 	}
 	if title == "" {
-		title = "Untitled Slack thread"
+		title = "Untitled intake item"
 	}
-	rootTS, _ := root["ts"].(string)
-	if rootTS == "" {
-		rootTS = threadTS
-	}
-	latestTS := latestSlackMessageTS(messages)
+	latestTS := slackMessageTS(latest)
 	if latestTS == "" {
-		latestTS = slackMessageTS(root)
+		latestTS = triggerTS
 	}
-	if latestTS == "" {
-		latestTS = threadTS
-	}
-	activityAt := slackTimestampToUTC(latestTS)
+	triggerUserID := firstString(trigger["user"])
+	latestUserID := firstString(latest["user"])
 	now := utcNow()
 	tx, err := s.store.db.Begin()
 	if err != nil {
@@ -671,161 +756,114 @@ func (s *Service) upsertThread(teamID, channelID, channelName, threadTS, sourceT
 	}
 	defer tx.Rollback()
 
-	var existingID int64
 	var existingStatus sql.NullString
+	var existingResolution sql.NullString
 	var existingLatestTS sql.NullString
-	var existingActivityAt sql.NullString
 	err = tx.QueryRow(`
-		SELECT st.id, st.status,
-		       COALESCE(st.latest_slack_message_ts, (
-		         SELECT MAX(sm.slack_message_ts)
-		         FROM slack_messages sm
-		         WHERE sm.slack_thread_id = st.id
-		       )) AS latest_slack_message_ts,
-		       st.last_slack_activity_at
-		FROM slack_threads st
-		WHERE st.slack_team_id=? AND st.channel_id=? AND st.thread_ts=?`,
+		SELECT status, resolution, latest_slack_message_ts
+		FROM intake_items
+		WHERE slack_team_id=? AND channel_id=? AND trigger_ts=?`,
 		teamID,
 		channelID,
-		threadTS,
-	).Scan(&existingID, &existingStatus, &existingLatestTS, &existingActivityAt)
+		triggerTS,
+	).Scan(&existingStatus, &existingResolution, &existingLatestTS)
 	if err != nil && err != sql.ErrNoRows {
 		return err
 	}
 	hasExisting := err == nil
-	status := "collected"
+	status := "pending"
+	var resolution any
 	if hasExisting {
 		status = existingStatus.String
 		if status == "" {
-			status = "collected"
+			status = "pending"
+		}
+		if existingResolution.Valid && existingResolution.String != "" {
+			resolution = existingResolution.String
 		}
 	}
 	hasNewSlackActivity := !hasExisting || !existingLatestTS.Valid || existingLatestTS.String == "" || slackTSAfter(latestTS, existingLatestTS.String)
 	if hasExisting && hasNewSlackActivity && shouldRecollectThread(status) {
-		status = "collected"
+		status = "pending"
+		resolution = nil
 	}
 	if hasExisting && existingLatestTS.Valid && existingLatestTS.String != "" && !slackTSAfter(latestTS, existingLatestTS.String) {
 		latestTS = existingLatestTS.String
-		if existingActivityAt.Valid && existingActivityAt.String != "" {
-			activityAt = existingActivityAt.String
-		}
 	}
 
 	if _, err := tx.Exec(`
-		INSERT INTO slack_threads(
-			slack_team_id, channel_id, channel_name, thread_ts, root_message_ts,
-			source_type, status, title, permalink, last_slack_activity_at,
-			latest_slack_message_ts, last_synced_at, raw_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(slack_team_id, channel_id, thread_ts) DO UPDATE SET
+		INSERT INTO intake_items(
+			slack_team_id, channel_id, channel_name, trigger_ts, thread_ts, source_type,
+			status, resolution, title, permalink, trigger_user_id, trigger_text,
+			latest_slack_message_ts, latest_user_id, latest_user_name,
+			latest_text, last_synced_at, raw_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(slack_team_id, channel_id, trigger_ts) DO UPDATE SET
 			channel_name=excluded.channel_name,
-			root_message_ts=excluded.root_message_ts,
+			thread_ts=excluded.thread_ts,
 			source_type=excluded.source_type,
 			status=excluded.status,
+			resolution=excluded.resolution,
 			title=excluded.title,
-			permalink=COALESCE(NULLIF(excluded.permalink, ''), slack_threads.permalink),
-			last_slack_activity_at=excluded.last_slack_activity_at,
+			permalink=COALESCE(NULLIF(excluded.permalink, ''), intake_items.permalink),
+			trigger_user_id=COALESCE(NULLIF(excluded.trigger_user_id, ''), intake_items.trigger_user_id),
+			trigger_text=COALESCE(NULLIF(excluded.trigger_text, ''), intake_items.trigger_text),
 			latest_slack_message_ts=excluded.latest_slack_message_ts,
+			latest_user_id=CASE
+				WHEN excluded.latest_slack_message_ts = intake_items.latest_slack_message_ts THEN COALESCE(NULLIF(intake_items.latest_user_id, ''), NULLIF(excluded.latest_user_id, ''))
+				ELSE COALESCE(NULLIF(excluded.latest_user_id, ''), intake_items.latest_user_id)
+			END,
+			latest_user_name=CASE
+				WHEN excluded.latest_slack_message_ts = intake_items.latest_slack_message_ts THEN COALESCE(NULLIF(intake_items.latest_user_name, ''), NULLIF(excluded.latest_user_name, ''))
+				ELSE COALESCE(NULLIF(excluded.latest_user_name, ''), intake_items.latest_user_name)
+			END,
+			latest_text=CASE
+				WHEN excluded.latest_slack_message_ts = intake_items.latest_slack_message_ts THEN COALESCE(NULLIF(intake_items.latest_text, ''), NULLIF(excluded.latest_text, ''))
+				ELSE COALESCE(NULLIF(excluded.latest_text, ''), intake_items.latest_text)
+			END,
 			last_synced_at=excluded.last_synced_at,
 			raw_json=excluded.raw_json`,
 		teamID,
 		channelID,
 		channelName,
+		triggerTS,
 		threadTS,
-		rootTS,
 		sourceType,
 		status,
+		resolution,
 		title,
-		root["permalink"],
-		activityAt,
+		trigger["permalink"],
+		triggerUserID,
+		slackMessageText(trigger),
 		latestTS,
+		latestUserID,
+		slackMessageUserName(latest),
+		slackMessageText(latest),
 		now,
-		mustJSON(root),
+		mustJSON(trigger),
 	); err != nil {
 		return err
-	}
-	var threadID int64
-	if err := tx.QueryRow(
-		"SELECT id FROM slack_threads WHERE slack_team_id=? AND channel_id=? AND thread_ts=?",
-		teamID,
-		channelID,
-		threadTS,
-	).Scan(&threadID); err != nil {
-		return err
-	}
-	for _, message := range messages {
-		ts, _ := message["ts"].(string)
-		if ts == "" {
-			continue
-		}
-		text, _ := message["text"].(string)
-		msgUser, _ := message["user"].(string)
-		mentions := 0
-		if strings.Contains(text, "<@"+userID+">") {
-			mentions = 1
-		}
-		isUser := 0
-		if msgUser == userID {
-			isUser = 1
-		}
-		if _, err := tx.Exec(`
-			INSERT INTO slack_messages(
-				slack_thread_id, slack_message_ts, user_id, user_name, text,
-				is_user_message, mentions_user, raw_json
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-				ON CONFLICT(slack_thread_id, slack_message_ts) DO UPDATE SET
-					user_id=excluded.user_id,
-					user_name=excluded.user_name,
-					text=excluded.text,
-					is_user_message=excluded.is_user_message,
-					mentions_user=excluded.mentions_user,
-					raw_json=excluded.raw_json`,
-			threadID,
-			ts,
-			msgUser,
-			message["username"],
-			text,
-			isUser,
-			mentions,
-			mustJSON(message),
-		); err != nil {
-			return err
-		}
 	}
 	return tx.Commit()
 }
 
 func (s *Service) QueueAnalysis(threadID int64) (map[string]any, error) {
 	var currentStatus string
-	if err := s.store.db.QueryRow("SELECT status FROM slack_threads WHERE id=?", threadID).Scan(&currentStatus); err != nil {
+	if err := s.store.db.QueryRow("SELECT status FROM intake_items WHERE id=?", threadID).Scan(&currentStatus); err != nil {
 		return nil, err
 	}
-	if currentStatus == "analysis_queued" {
-		queued := s.enqueueAnalysis(threadID)
-		return map[string]any{"queued": queued, "thread_id": threadID, "status": currentStatus, "reason": "already_queued"}, nil
+	if s.isAnalysisActive(threadID) {
+		return map[string]any{"queued": false, "intake_item_id": threadID, "status": currentStatus, "reason": "already_analyzing"}, nil
 	}
-	if currentStatus == "analyzing" {
-		return map[string]any{"queued": false, "thread_id": threadID, "status": currentStatus, "reason": "already_analyzing"}, nil
+	if currentStatus != "pending" {
+		return map[string]any{"queued": false, "intake_item_id": threadID, "status": currentStatus, "reason": "not_analyzable"}, nil
 	}
-	if currentStatus != "collected" && currentStatus != "analysis_failed" {
-		return map[string]any{"queued": false, "thread_id": threadID, "status": currentStatus, "reason": "not_analyzable"}, nil
+	queued := s.enqueueAnalysis(threadID)
+	reason := ""
+	if !queued {
+		reason = "analysis_queue_full"
 	}
-	result, err := s.store.db.Exec(
-		"UPDATE slack_threads SET status='analysis_queued' WHERE id=? AND status IN ('collected', 'analysis_failed')",
-		threadID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	updated, err := result.RowsAffected()
-	if err != nil {
-		return nil, err
-	}
-	if updated == 0 {
-		return map[string]any{"queued": false, "thread_id": threadID, "reason": "status_changed"}, nil
-	}
-	s.enqueueAnalysis(threadID)
-	return map[string]any{"queued": true, "thread_id": threadID, "status": "analysis_queued"}, nil
+	return map[string]any{"queued": queued, "intake_item_id": threadID, "status": currentStatus, "reason": reason}, nil
 }
 
 func (s *Service) QueueJob(jobID int64) (map[string]any, error) {
@@ -884,7 +922,7 @@ func (s *Service) analyzerLoop() {
 	for threadID := range s.analyses {
 		advanced := s.runAnalysis(threadID)
 		s.analysisMu.Lock()
-		delete(s.queuedAnalyses, threadID)
+		delete(s.activeAnalyses, threadID)
 		s.analysisMu.Unlock()
 		if advanced {
 			s.signalAutoAdvance()
@@ -906,51 +944,71 @@ func (s *Service) workerLoop() {
 }
 
 func (s *Service) signalAutoAdvance() {
-	if !s.cfg.AutoAdvance {
-		return
-	}
+	s.signalAnalysisAdvance()
+	s.signalJobAdvance()
+}
+
+func (s *Service) signalAnalysisAdvance() {
 	select {
-	case s.autoAdvance <- struct{}{}:
+	case s.analysisAdvance <- struct{}{}:
 	default:
 	}
 }
 
-func (s *Service) autoAdvanceLoop() {
+func (s *Service) signalJobAdvance() {
+	select {
+	case s.jobAdvance <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Service) analysisSchedulerLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-s.autoAdvance:
-			s.advanceIntake()
+		case <-s.analysisAdvance:
+			s.queuePendingAnalyses()
 		case <-ticker.C:
-			s.advanceIntake()
+			s.queuePendingAnalyses()
+		}
+	}
+}
+
+func (s *Service) jobSchedulerLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.jobAdvance:
+			s.queuePendingJobs()
+		case <-ticker.C:
+			s.queuePendingJobs()
 		}
 	}
 }
 
 func (s *Service) advanceIntake() {
-	s.queuePendingAnalyses()
 	s.queuePendingJobs()
+	s.queuePendingAnalyses()
 }
 
 func (s *Service) queuePendingAnalyses() {
 	rows, err := s.store.db.Query(`
-		SELECT st.id, st.status
-		FROM slack_threads st
-		WHERE st.status IN ('collected', 'analysis_queued', 'analyzing')
-		ORDER BY st.last_slack_activity_at ASC, st.id ASC`)
+		SELECT st.id
+		FROM intake_items st
+		WHERE st.status = 'pending'
+		ORDER BY COALESCE(st.latest_slack_message_ts, st.trigger_ts) ASC, st.id ASC`)
 	if err != nil {
 		return
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var threadID int64
-		var status string
-		if err := rows.Scan(&threadID, &status); err != nil {
+		if err := rows.Scan(&threadID); err != nil {
 			continue
 		}
-		if status == "analysis_queued" || status == "analyzing" {
-			s.enqueueAnalysis(threadID)
+		if s.isAnalysisActive(threadID) {
 			continue
 		}
 		_, _ = s.QueueAnalysis(threadID)
@@ -1011,25 +1069,40 @@ func (s *Service) isJobWorking(jobID int64) bool {
 
 func (s *Service) enqueueAnalysis(threadID int64) bool {
 	s.analysisMu.Lock()
-	if _, exists := s.queuedAnalyses[threadID]; exists {
-		s.analysisMu.Unlock()
+	defer s.analysisMu.Unlock()
+	if s.analyses == nil {
+		s.analyses = make(chan int64, 100)
+	}
+	if s.activeAnalyses == nil {
+		s.activeAnalyses = make(map[int64]struct{})
+	}
+	if _, exists := s.activeAnalyses[threadID]; exists {
 		return false
 	}
-	s.queuedAnalyses[threadID] = struct{}{}
-	s.analysisMu.Unlock()
-	s.analyses <- threadID
-	return true
+	select {
+	case s.analyses <- threadID:
+		s.activeAnalyses[threadID] = struct{}{}
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) isAnalysisActive(threadID int64) bool {
+	s.analysisMu.Lock()
+	defer s.analysisMu.Unlock()
+	_, exists := s.activeAnalyses[threadID]
+	return exists
 }
 
 func (s *Service) runAnalysis(threadID int64) bool {
 	started := utcNow()
-	_, _ = s.store.db.Exec("UPDATE slack_threads SET status='analyzing' WHERE id=?", threadID)
-	result, err := s.store.db.Exec("INSERT INTO analysis_runs(slack_thread_id, status, started_at) VALUES (?, 'running', ?)", threadID, started)
+	result, err := s.store.db.Exec("INSERT INTO analysis_runs(intake_item_id, status, started_at) VALUES (?, 'running', ?)", threadID, started)
 	if err != nil {
 		return false
 	}
 	analysisID, _ := result.LastInsertId()
-	thread, messages, err := s.threadContext(threadID)
+	thread, err := s.threadContext(threadID)
 	if err != nil {
 		s.finishAnalysisError(threadID, analysisID, err)
 		return false
@@ -1048,12 +1121,12 @@ func (s *Service) runAnalysis(threadID int64) bool {
 		s.finishAnalysisError(threadID, analysisID, err)
 		return false
 	}
-	codexThreadID, err := client.StartThread(s.cfg.CodexThreadOptions(workspace))
+	codexThread, err := client.StartThread(s.cfg.CodexThreadOptions(workspace))
 	if err != nil {
 		s.finishAnalysisError(threadID, analysisID, err)
 		return false
 	}
-	turn := client.RunTurn(codexThreadID, analysisPrompt(thread, messages, s.relatedJobsForThread(threadID, 20)), 10*time.Minute)
+	turn := client.RunTurn(codexThread.ThreadID, analysisPrompt(thread, s.relatedJobsForThread(threadID, 20)), 10*time.Minute)
 	final := turn.FinalText
 	analysis := parseAnalysisOutput(final)
 	status := "completed"
@@ -1063,7 +1136,7 @@ func (s *Service) runAnalysis(threadID int64) bool {
 	_, _ = s.store.db.Exec(`
 		UPDATE analysis_runs
 		SET status=?, action_required=?, confidence=?, summary=?, rationale=?,
-			structured_result_json=?, codex_thread_id=?, completed_at=?, error=?
+			structured_result_json=?, codex_thread_id=?, codex_session_id=?, completed_at=?, error=?
 			WHERE id=?`,
 		status,
 		boolToInt(analysis.ActionRequired),
@@ -1071,50 +1144,37 @@ func (s *Service) runAnalysis(threadID int64) bool {
 		truncate(analysis.Summary, 800),
 		truncate(analysis.Rationale, 800),
 		analysis.structuredResultJSON(final, turn.Events),
-		codexThreadID,
+		codexThread.ThreadID,
+		codexThread.SessionID,
 		utcNow(),
 		nullIfEmpty(turn.Error),
 		analysisID,
 	)
 	if turn.Error != "" {
-		_, _ = s.store.db.Exec("UPDATE slack_threads SET status='analysis_queued' WHERE id=?", threadID)
 		return false
 	}
 	analyzedSlackTS := latestSlackTSFromThread(thread)
 	if !analysis.ActionRequired {
-		_, _ = s.store.db.Exec("UPDATE slack_threads SET status='no_action', last_analyzed_slack_ts=? WHERE id=?", analyzedSlackTS, threadID)
+		s.resolveIntakeItemIfCurrent(threadID, analyzedSlackTS, "no_action")
 		return true
 	}
-	_, _ = s.store.db.Exec("UPDATE slack_threads SET status='job_created', last_analyzed_slack_ts=? WHERE id=?", analyzedSlackTS, threadID)
 	title := analysis.TaskTitle
 	if title == "" {
 		title, _ = thread["title"].(string)
 	}
 	if title == "" {
-		title = fmt.Sprintf("Slack thread %d", threadID)
+		title = fmt.Sprintf("Intake item %d", threadID)
 	}
 	urgency := analysis.Urgency
 	if urgency == "" {
 		urgency = "medium"
 	}
-	insertResult, err := s.store.db.Exec(`
-		INSERT INTO jobs(
-			slack_thread_id, analysis_run_id, title, status, urgency, task_type,
-			workspace_path, bootstrap_status, created_at, updated_at
-		) VALUES (?, ?, ?, 'queued', ?, 'slack_task', ?, 'succeeded', ?, ?)`,
-		threadID,
-		analysisID,
-		title,
-		urgency,
-		workspace,
-		utcNow(),
-		utcNow(),
-	)
+	jobID, err := s.createJobIfIntakeCurrent(threadID, analysisID, analyzedSlackTS, title, urgency, workspace)
 	if err != nil {
 		s.finishAnalysisError(threadID, analysisID, err)
 		return false
 	}
-	if jobID, err := insertResult.LastInsertId(); err == nil && s.cfg.AutoAdvance {
+	if jobID > 0 {
 		_, _ = s.QueueJob(jobID)
 	}
 	return true
@@ -1122,7 +1182,80 @@ func (s *Service) runAnalysis(threadID int64) bool {
 
 func (s *Service) finishAnalysisError(threadID, analysisID int64, err error) {
 	_, _ = s.store.db.Exec("UPDATE analysis_runs SET status='failed', completed_at=?, error=? WHERE id=?", utcNow(), err.Error(), analysisID)
-	_, _ = s.store.db.Exec("UPDATE slack_threads SET status='analysis_queued' WHERE id=?", threadID)
+}
+
+func (s *Service) resolveIntakeItemIfCurrent(threadID int64, analyzedSlackTS, resolution string) bool {
+	result, err := s.store.db.Exec(`
+		UPDATE intake_items
+		SET status='resolved', resolution=?, last_analyzed_slack_ts=?
+		WHERE id=?
+		  AND status='pending'
+		  AND COALESCE(latest_slack_message_ts, trigger_ts)=?`,
+		resolution,
+		analyzedSlackTS,
+		threadID,
+		analyzedSlackTS,
+	)
+	if err != nil {
+		return false
+	}
+	updated, err := result.RowsAffected()
+	return err == nil && updated > 0
+}
+
+func (s *Service) createJobIfIntakeCurrent(threadID, analysisID int64, analyzedSlackTS, title, urgency, workspace string) (int64, error) {
+	now := utcNow()
+	tx, err := s.store.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.Exec(`
+		UPDATE intake_items
+		SET status='resolved', resolution='job_created', last_analyzed_slack_ts=?
+		WHERE id=?
+		  AND status='pending'
+		  AND COALESCE(latest_slack_message_ts, trigger_ts)=?`,
+		analyzedSlackTS,
+		threadID,
+		analyzedSlackTS,
+	)
+	if err != nil {
+		return 0, err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if updated == 0 {
+		return 0, tx.Commit()
+	}
+
+	insertResult, err := tx.Exec(`
+		INSERT INTO jobs(
+			intake_item_id, analysis_run_id, title, status, urgency, task_type,
+			workspace_path, bootstrap_status, created_at, updated_at
+		) VALUES (?, ?, ?, 'queued', ?, 'slack_task', ?, 'succeeded', ?, ?)`,
+		threadID,
+		analysisID,
+		title,
+		urgency,
+		workspace,
+		now,
+		now,
+	)
+	if err != nil {
+		return 0, err
+	}
+	jobID, err := insertResult.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return jobID, nil
 }
 
 func (s *Service) ensureAnalyzerWorkspace(threadID, analysisID int64, workspace string) bool {
@@ -1148,7 +1281,7 @@ func (s *Service) ensureAnalyzerWorkspace(threadID, analysisID int64, workspace 
 }
 
 func (s *Service) threadWorkspace(threadID int64) string {
-	return filepath.Join(s.cfg.WorkspaceRoot, fmt.Sprintf("thread-%d", threadID))
+	return filepath.Join(s.cfg.WorkspaceRoot, fmt.Sprintf("intake-%d", threadID))
 }
 
 func (s *Service) runJob(jobID int64) bool {
@@ -1174,27 +1307,83 @@ func (s *Service) runJob(jobID int64) bool {
 		s.retryJobAfterWorkerError(jobID, "Codex app-server initialization failed: "+err.Error(), map[string]any{"error": err.Error()})
 		return false
 	}
-	codexThreadID, err := client.StartThread(s.cfg.CodexThreadOptions(workspace))
+	codexThread, err := client.StartThread(s.cfg.CodexThreadOptions(workspace))
 	if err != nil {
 		s.retryJobAfterWorkerError(jobID, "Codex thread startup failed: "+err.Error(), map[string]any{"error": err.Error()})
 		return false
 	}
-	s.updateJob(jobID, map[string]any{"codex_thread_id": codexThreadID})
-	turn := client.RunTurn(codexThreadID, workerPrompt(job, s.threadMessages(jobID)), time.Hour)
-	s.event(jobID, "worker_completed", truncate(turn.FinalText, 2000), map[string]any{"events": turn.Events, "error": turn.Error})
+	workerSessionID := s.startWorkerSession(jobID, codexThread)
+	s.updateJob(jobID, map[string]any{
+		"codex_thread_id":  codexThread.ThreadID,
+		"codex_session_id": codexThread.SessionID,
+	})
+	s.event(jobID, "codex_session_started", codexThread.SessionID, map[string]any{
+		"codex_thread_id":   codexThread.ThreadID,
+		"codex_session_id":  codexThread.SessionID,
+		"worker_session_id": workerSessionID,
+		"workspace":         workspace,
+	})
+	turn := client.RunTurn(codexThread.ThreadID, workerPrompt(job), time.Hour)
+	s.event(jobID, "worker_completed", truncate(turn.FinalText, 2000), map[string]any{
+		"events":            turn.Events,
+		"error":             turn.Error,
+		"codex_thread_id":   codexThread.ThreadID,
+		"codex_session_id":  codexThread.SessionID,
+		"worker_session_id": workerSessionID,
+	})
 	if turn.Error != "" {
-		s.retryJobAfterWorkerError(jobID, "Codex worker turn failed: "+turn.Error, map[string]any{"error": turn.Error, "codex_thread_id": codexThreadID})
+		s.finishWorkerSession(workerSessionID, "failed", turn.Error)
+		s.retryJobAfterWorkerError(jobID, "Codex worker turn failed: "+turn.Error, map[string]any{
+			"error":             turn.Error,
+			"codex_thread_id":   codexThread.ThreadID,
+			"codex_session_id":  codexThread.SessionID,
+			"worker_session_id": workerSessionID,
+		})
 		return false
 	}
+	s.finishWorkerSession(workerSessionID, "completed", "")
 	s.finishJobFromWorkerOutput(jobID, turn.FinalText)
 	return true
+}
+
+func (s *Service) startWorkerSession(jobID int64, ref CodexThreadRef) int64 {
+	result, err := s.store.db.Exec(`
+		INSERT INTO worker_sessions(
+			job_id, codex_thread_id, codex_session_id, status, started_at
+		) VALUES (?, ?, ?, 'running', ?)`,
+		jobID,
+		ref.ThreadID,
+		ref.SessionID,
+		utcNow(),
+	)
+	if err != nil {
+		return 0
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0
+	}
+	return id
+}
+
+func (s *Service) finishWorkerSession(workerSessionID int64, status, errorText string) {
+	if workerSessionID == 0 {
+		return
+	}
+	_, _ = s.store.db.Exec(
+		"UPDATE worker_sessions SET status=?, completed_at=?, error=? WHERE id=?",
+		status,
+		utcNow(),
+		nullIfEmpty(errorText),
+		workerSessionID,
+	)
 }
 
 func (s *Service) jobWorkspace(jobID int64, job map[string]any) string {
 	if workspace, ok := nonEmptyMapString(job["workspace_path"]); ok {
 		return workspace
 	}
-	if threadID, ok := int64Value(job["slack_thread_id"]); ok && threadID > 0 {
+	if threadID, ok := int64Value(job["intake_item_id"]); ok && threadID > 0 {
 		return s.threadWorkspace(threadID)
 	}
 	return filepath.Join(s.cfg.WorkspaceRoot, fmt.Sprintf("job-%d", jobID))
@@ -1322,7 +1511,7 @@ func (s *Service) SendReply(replyID int64) (map[string]any, error) {
 		permalink, _ = client.ChatGetPermalink(channel, ts)
 	}
 	_, _ = s.store.db.Exec("UPDATE reply_drafts SET status='sent', slack_message_ts=?, sent_permalink=?, updated_at=? WHERE id=?", ts, permalink, utcNow(), replyID)
-	_, _ = s.store.db.Exec("UPDATE slack_threads SET status='archived' WHERE id=?", reply["slack_thread_id"])
+	_, _ = s.store.db.Exec("UPDATE intake_items SET status='resolved', resolution='reply_sent' WHERE id=?", reply["intake_item_id"])
 	return map[string]any{"reply_id": replyID, "slack": payload, "sent_permalink": permalink}, nil
 }
 
@@ -1331,7 +1520,7 @@ func (s *Service) ArchiveReply(replyID int64) (map[string]any, error) {
 	var threadID int64
 	var status string
 	if err := s.store.db.QueryRow(
-		"SELECT job_id, slack_thread_id, status FROM reply_drafts WHERE id=?",
+		"SELECT job_id, intake_item_id, status FROM reply_drafts WHERE id=?",
 		replyID,
 	).Scan(&jobID, &threadID, &status); err != nil {
 		return nil, err
@@ -1349,7 +1538,7 @@ func (s *Service) ArchiveReply(replyID int64) (map[string]any, error) {
 	if _, err := tx.Exec("UPDATE reply_drafts SET status='ignored', updated_at=? WHERE id=?", now, replyID); err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec("UPDATE slack_threads SET status='archived' WHERE id=?", threadID); err != nil {
+	if _, err := tx.Exec("UPDATE intake_items SET status='resolved', resolution='reply_ignored' WHERE id=?", threadID); err != nil {
 		return nil, err
 	}
 	if jobID.Valid {
@@ -1375,19 +1564,18 @@ func (s *Service) ArchiveReply(replyID int64) (map[string]any, error) {
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return map[string]any{"reply_id": replyID, "thread_id": threadID, "status": "ignored"}, nil
+	return map[string]any{"reply_id": replyID, "intake_item_id": threadID, "status": "ignored"}, nil
 }
 
-func (s *Service) threadContext(threadID int64) (map[string]any, []map[string]any, error) {
-	threads, err := s.store.queryMaps("SELECT * FROM slack_threads WHERE id=?", threadID)
+func (s *Service) threadContext(threadID int64) (map[string]any, error) {
+	threads, err := s.store.queryMaps("SELECT * FROM intake_items WHERE id=?", threadID)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if len(threads) == 0 {
-		return nil, nil, sql.ErrNoRows
+		return nil, sql.ErrNoRows
 	}
-	messages, err := s.store.queryMaps("SELECT * FROM slack_messages WHERE slack_thread_id=? ORDER BY slack_message_ts", threadID)
-	return threads[0], messages, err
+	return threads[0], nil
 }
 
 func (s *Service) relatedJobsForThread(threadID int64, limit int) []map[string]any {
@@ -1395,10 +1583,10 @@ func (s *Service) relatedJobsForThread(threadID int64, limit int) []map[string]a
 		limit = 20
 	}
 	rows, err := s.store.queryMaps(`
-		SELECT j.id, j.slack_thread_id, j.title, j.status, j.urgency, j.task_type,
+		SELECT j.id, j.intake_item_id, j.title, j.status, j.urgency, j.task_type,
 		       j.current_block_reason, j.next_user_action, j.created_at, j.updated_at,
-		       st.channel_id, st.channel_name, st.thread_ts, st.source_type,
-		       st.title AS thread_title, st.last_slack_activity_at, st.latest_slack_message_ts,
+		       st.channel_id, st.channel_name, st.trigger_ts, st.thread_ts, st.source_type,
+		       st.title AS thread_title, st.latest_slack_message_ts,
 		       ar.summary AS analyzer_summary, ar.rationale AS analyzer_rationale,
 		       (
 		         SELECT rd.status
@@ -1415,18 +1603,18 @@ func (s *Service) relatedJobsForThread(threadID int64, limit int) []map[string]a
 		         LIMIT 1
 		       ) AS latest_reply_updated_at
 		FROM jobs j
-		JOIN slack_threads st ON st.id = j.slack_thread_id
-		JOIN slack_threads trigger_thread ON trigger_thread.id = ?
+		JOIN intake_items st ON st.id = j.intake_item_id
+		JOIN intake_items trigger_thread ON trigger_thread.id = ?
 		LEFT JOIN analysis_runs ar ON ar.id = (
 			SELECT id
 			FROM analysis_runs
-			WHERE slack_thread_id = st.id
+			WHERE intake_item_id = st.id
 			ORDER BY id DESC
 			LIMIT 1
 		)
 		WHERE st.slack_team_id = trigger_thread.slack_team_id
 		  AND st.channel_id = trigger_thread.channel_id
-		ORDER BY COALESCE(st.last_slack_activity_at, j.updated_at, j.created_at) DESC,
+		ORDER BY COALESCE(st.latest_slack_message_ts, st.trigger_ts) DESC,
 		         j.updated_at DESC,
 		         j.id DESC
 		LIMIT ?`, threadID, limit)
@@ -1437,7 +1625,17 @@ func (s *Service) relatedJobsForThread(threadID int64, limit int) []map[string]a
 }
 
 func (s *Service) job(jobID int64) (map[string]any, error) {
-	rows, err := s.store.queryMaps("SELECT * FROM jobs WHERE id=?", jobID)
+	rows, err := s.store.queryMaps(`
+		SELECT j.*,
+		       st.slack_team_id, st.channel_id, st.channel_name, st.trigger_ts, st.thread_ts,
+		       st.source_type, st.permalink,
+		       st.title AS thread_title, st.trigger_user_id, st.trigger_text,
+		       st.trigger_user_id AS root_user_id, st.trigger_text AS root_text,
+		       st.latest_slack_message_ts, st.latest_user_id,
+		       st.latest_user_name, st.latest_text
+		FROM jobs j
+		JOIN intake_items st ON st.id = j.intake_item_id
+		WHERE j.id=?`, jobID)
 	if err != nil {
 		return nil, err
 	}
@@ -1445,19 +1643,6 @@ func (s *Service) job(jobID int64) (map[string]any, error) {
 		return nil, sql.ErrNoRows
 	}
 	return rows[0], nil
-}
-
-func (s *Service) threadMessages(jobID int64) []map[string]any {
-	rows, err := s.store.queryMaps(`
-		SELECT sm.*
-		FROM slack_messages sm
-		JOIN jobs j ON j.slack_thread_id = sm.slack_thread_id
-		WHERE j.id = ?
-		ORDER BY sm.slack_message_ts`, jobID)
-	if err != nil {
-		return nil
-	}
-	return rows
 }
 
 func (s *Service) updateJob(jobID int64, fields map[string]any) {
@@ -1522,10 +1707,20 @@ func (s *Service) recoverInterruptedJobs() {
 	}
 }
 
-func (s *Service) updateThreadStatusForJob(jobID int64, status string) {
+func (s *Service) recoverInterruptedWorkerSessions() {
+	_, _ = s.store.db.Exec(`
+		UPDATE worker_sessions
+		SET status='failed', completed_at=?, error=?
+		WHERE status='running'`,
+		utcNow(),
+		"Worker session interrupted before completion.",
+	)
+}
+
+func (s *Service) updateIntakeResolutionForJob(jobID int64, resolution string) {
 	_, _ = s.store.db.Exec(
-		"UPDATE slack_threads SET status=? WHERE id=(SELECT slack_thread_id FROM jobs WHERE id=?)",
-		status,
+		"UPDATE intake_items SET status='resolved', resolution=? WHERE id=(SELECT intake_item_id FROM jobs WHERE id=?)",
+		resolution,
 		jobID,
 	)
 }
@@ -1543,9 +1738,9 @@ func (s *Service) event(jobID int64, eventType, message string, payload map[stri
 
 func (s *Service) createReply(jobID int64, draftText, rationale string) {
 	rows, err := s.store.queryMaps(`
-		SELECT j.slack_thread_id, st.channel_id, st.thread_ts
+		SELECT j.intake_item_id, st.channel_id, st.thread_ts
 		FROM jobs j
-		JOIN slack_threads st ON st.id = j.slack_thread_id
+		JOIN intake_items st ON st.id = j.intake_item_id
 		WHERE j.id = ?`, jobID)
 	if err != nil || len(rows) == 0 {
 		return
@@ -1553,11 +1748,11 @@ func (s *Service) createReply(jobID int64, draftText, rationale string) {
 	row := rows[0]
 	_, _ = s.store.db.Exec(`
 		INSERT INTO reply_drafts(
-			job_id, slack_thread_id, status, draft_text, edited_text, rationale,
+			job_id, intake_item_id, status, draft_text, edited_text, rationale,
 			slack_channel_id, slack_thread_ts, created_at, updated_at
 		) VALUES (?, ?, 'draft', ?, NULL, ?, ?, ?, ?, ?)`,
 		jobID,
-		row["slack_thread_id"],
+		row["intake_item_id"],
 		draftText,
 		rationale,
 		row["channel_id"],
@@ -1619,7 +1814,7 @@ func (s *Service) finishJobFromWorkerOutput(jobID int64, finalText string) {
 			"current_block_reason": nil,
 			"next_user_action":     nil,
 		})
-		s.updateThreadStatusForJob(jobID, "archived")
+		s.updateIntakeResolutionForJob(jobID, "completed_no_reply")
 	default:
 		if result.ReplyDraft != "" {
 			s.updateJob(jobID, map[string]any{
@@ -1634,16 +1829,16 @@ func (s *Service) finishJobFromWorkerOutput(jobID int64, finalText string) {
 			"current_block_reason": nil,
 			"next_user_action":     nil,
 		})
-		s.updateThreadStatusForJob(jobID, "archived")
+		s.updateIntakeResolutionForJob(jobID, "completed_no_reply")
 	}
 }
 
-func analysisPrompt(thread map[string]any, messages []map[string]any, relatedJobs []map[string]any) string {
+func analysisPrompt(thread map[string]any, relatedJobs []map[string]any) string {
 	return fmt.Sprintf(`Analyze this Slack intake trigger for my personal work agent.
 
 This Slack message/thread is a trigger event. Do not assume it is a standalone task.
 
-Before deciding, use the available Slack context skill/capabilities from the workspace when useful. For DMs especially, inspect nearby messages in the same DM around the trigger timestamp; people often continue the same topic as separate DM messages instead of Slack thread replies. If the trigger belongs to a native Slack thread, inspect the full thread as well.
+The local database stores only Slack trigger metadata, not a full Slack message transcript. Before deciding, use the available Slack context skill/capabilities from the workspace to fetch the latest relevant Slack messages by channel_id, thread_ts, and permalink. For DMs especially, inspect nearby messages in the same DM around the trigger timestamp; people often continue the same topic as separate DM messages instead of Slack thread replies. If the trigger belongs to a native Slack thread, inspect the full thread as well.
 
 Related jobs from the same Slack DM/channel are included below, sorted by most recent activity, with at most 20 jobs. Also check whether the same topic is already covered by an existing or running job, a pending reply draft, a sent system reply, or my own Slack reply. If it is already covered or already answered, do not create another worker job.
 
@@ -1669,23 +1864,20 @@ Rules:
 - Keep values Slack-work focused and concise.
 - Keep JSON keys exactly as shown, but write user-facing string values in Simplified Chinese, including summary, task_title, why_it_matters, worker_plan, needed_user_confirmation, and rationale.
 
-Slack thread:
+Slack trigger metadata:
 %v
-
-Messages:
-%s
 
 Related jobs from same Slack DM/channel:
 %v
-`, thread, transcript(messages), relatedJobs)
+`, thread, relatedJobs)
 }
 
-func workerPrompt(job map[string]any, messages []map[string]any) string {
+func workerPrompt(job map[string]any) string {
 	return fmt.Sprintf(`You are a Codex worker for my personal Slack Agent.
 
 You may use local files, commands, repos, tests, and tools that work inside the local Codex workspace to move this task forward.
 Network access and permissions outside the local workspace are intentionally unavailable by default. If they are required, report the blocker instead of waiting for approval.
-Before working, use the available Slack context skill/capabilities from the workspace when useful to refresh the latest relevant Slack context. For DM jobs, inspect nearby messages in the same DM around the original trigger and any newer messages in the same conversation; people often continue the same topic as separate DM messages instead of Slack thread replies.
+The local database stores only Slack trigger metadata, not a full Slack message transcript. Before working, use the available Slack context skill/capabilities from the workspace to refresh the latest relevant Slack context by channel_id, thread_ts, and permalink. For DM jobs, inspect nearby messages in the same DM around the original trigger and any newer messages in the same conversation; people often continue the same topic as separate DM messages instead of Slack thread replies.
 If refreshed context shows this topic is already handled by another active job, a sent system reply, or my own Slack reply after the latest relevant external message, stop without drafting another reply and report completed_no_reply with evidence.
 Hard policy: do not send Slack messages. If a Slack reply is useful, draft it only.
 Before drafting a Slack reply, check again whether a Slack reply has already been sent or I have already replied after the latest relevant external message.
@@ -1702,22 +1894,7 @@ SLACK_REPLY_DRAFT:
 
 Job:
 %v
-
-Messages:
-%s
-`, job, transcript(messages))
-}
-
-func transcript(messages []map[string]any) string {
-	var lines []string
-	for _, message := range messages {
-		name := fmt.Sprint(message["user_name"])
-		if name == "" || name == "<nil>" {
-			name = fmt.Sprint(message["user_id"])
-		}
-		lines = append(lines, fmt.Sprintf("%s: %s", name, message["text"]))
-	}
-	return strings.Join(lines, "\n")
+`, job)
 }
 
 type workerOutput struct {

@@ -43,16 +43,17 @@ make frontend
 
 Copy `.env.example` to `.env` and set real Slack credentials.
 
-Intake auto-advance is enabled by default. After startup and after each Slack
-sync, collected threads are queued for analysis, action-required threads create
-jobs, and queued jobs are run until they reach a draft, blocked/failed review
-state, or a terminal no-reply state.
+Slack sync and intake auto-advance run in the background by default. On startup
+and after each Slack sync, pending intake items are analyzed, action-required
+items create jobs, and queued jobs are run until they reach a draft,
+blocked/failed review state, or a terminal no-reply state.
 
 Useful automation knobs:
 
-- `SLACK_AGENT_AUTO_ADVANCE=false` disables background advancement.
 - `SLACK_AGENT_ANALYZER_CONCURRENCY=1` controls concurrent analyzer sessions.
 - `SLACK_AGENT_WORKER_CONCURRENCY=2` controls concurrent worker sessions.
+- `SLACK_AGENT_SYNC_INTERVAL_SECONDS=300` controls how often the backend starts
+  the next background Slack sync after the previous sync finishes.
 - `SLACK_AGENT_SEARCH_PAGE_SIZE=100` and `SLACK_AGENT_SEARCH_MAX_PAGES=20`
   control mention/user-participation search depth.
 - `SLACK_AGENT_INCLUDE_USER_PARTICIPATED=true` opts into `from:@user`
@@ -63,9 +64,9 @@ Useful automation knobs:
   `SLACK_AGENT_DM_HISTORY_MAX_PAGES=10` control per-DM history depth.
 - `SLACK_AGENT_REPLY_PAGE_SIZE=200` and `SLACK_AGENT_REPLY_MAX_PAGES=10`
   control thread reply depth.
-- `SLACK_AGENT_SEARCH_LOOKBACK_DAYS=14` keeps an overlap window around sync
+- `SLACK_AGENT_SEARCH_LOOKBACK_DAYS=3` keeps an overlap window around sync
   cursors so slower background syncs do not miss late-arriving updates.
-- Codex analyzer and worker threads share a per-Slack-thread workspace. The
+- Codex analyzer and worker sessions share a per-intake workspace. The
   analyzer runs the configured workspace bootstrap before starting; later worker
   sessions reuse that workspace and default to local-only execution:
   `SLACK_AGENT_CODEX_PERMISSION_PROFILE=:workspace` with
@@ -79,7 +80,9 @@ Slack sending is only performed through the reply review endpoint:
 ## Current Notes
 
 - The backend uses local SQLite under `data/` by default.
+- SQLite stores Slack trigger coordinates and summary fields, not full Slack
+  message transcripts. Analyzer and worker sessions refresh Slack context live.
 - Codex workers use `codex app-server` over stdio JSON-RPC.
-- Each Slack thread gets a local workspace under `data/workspaces`.
+- Each intake item gets a local workspace under `data/workspaces`.
 - The default bootstrap command is `install-chi-skills`; health checks show
   a missing-config state if it is not on `PATH`.

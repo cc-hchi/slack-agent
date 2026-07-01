@@ -48,6 +48,29 @@ func TestConfigCodexThreadOptionsFallbackToSandbox(t *testing.T) {
 	}
 }
 
+func TestCodexThreadRefFromStartResultKeepsSessionID(t *testing.T) {
+	ref, err := codexThreadRefFromStartResult(map[string]any{
+		"thread": map[string]any{
+			"id":        "thread-1",
+			"sessionId": "session-1",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.ThreadID != "thread-1" || ref.SessionID != "session-1" {
+		t.Fatalf("unexpected thread ref: %#v", ref)
+	}
+
+	ref, err = codexThreadRefFromStartResult(map[string]any{"sessionId": "session-only"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.ThreadID != "session-only" || ref.SessionID != "session-only" {
+		t.Fatalf("expected session fallback, got %#v", ref)
+	}
+}
+
 func TestReadStdoutHandlesLargeNotificationLines(t *testing.T) {
 	largeText := strings.Repeat("x", 90*1024)
 	notification := map[string]any{

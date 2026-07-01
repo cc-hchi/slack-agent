@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func testService(t *testing.T) (*Service, *Store) {
@@ -29,51 +30,48 @@ func testService(t *testing.T) (*Service, *Store) {
 	return &Service{cfg: cfg, store: store}, store
 }
 
-func TestUpsertThreadUsesRootLatestActivityAndRecollectsTerminalThread(t *testing.T) {
+func TestUpsertIntakeItemUsesTriggerLatestActivityAndReopensResolvedItem(t *testing.T) {
 	service, store := testService(t)
 	root := map[string]any{"ts": "1764168000.000100", "text": "Root task"}
 	reply := map[string]any{"ts": "1764168060.000200", "thread_ts": "1764168000.000100", "text": "Reply"}
-	if err := service.upsertThread("T1", "C1", "backend", "1764168000.000100", "mention", root, []map[string]any{root, reply}, "U-me"); err != nil {
+	if err := service.upsertIntakeItem("T1", "C1", "backend", "1764168000.000100", "1764168000.000100", "mention", root, []map[string]any{root, reply}, "U-me"); err != nil {
 		t.Fatal(err)
 	}
 
-	var title, rootTS, latestTS, activityAt string
+	var title, triggerText, latestTS, latestText string
 	if err := store.db.QueryRow(`
-		SELECT title, root_message_ts, latest_slack_message_ts, last_slack_activity_at
-		FROM slack_threads
+		SELECT title, trigger_text, latest_slack_message_ts, latest_text
+		FROM intake_items
 		WHERE slack_team_id='T1' AND channel_id='C1' AND thread_ts='1764168000.000100'`,
-	).Scan(&title, &rootTS, &latestTS, &activityAt); err != nil {
+	).Scan(&title, &triggerText, &latestTS, &latestText); err != nil {
 		t.Fatal(err)
 	}
-	if title != "Root task" || rootTS != "1764168000.000100" || latestTS != "1764168060.000200" {
-		t.Fatalf("unexpected thread metadata: title=%q root=%q latest=%q", title, rootTS, latestTS)
-	}
-	if activityAt != "2025-11-26T14:41:00Z" {
-		t.Fatalf("expected Slack activity time, got %q", activityAt)
+	if title != "Root task" || triggerText != "Root task" || latestTS != "1764168060.000200" || latestText != "Reply" {
+		t.Fatalf("unexpected intake metadata: title=%q trigger_text=%q latest=%q latest_text=%q", title, triggerText, latestTS, latestText)
 	}
 
-	if _, err := store.db.Exec("UPDATE slack_threads SET status='no_action' WHERE slack_team_id='T1' AND channel_id='C1' AND thread_ts='1764168000.000100'"); err != nil {
+	if _, err := store.db.Exec("UPDATE intake_items SET status='resolved' WHERE slack_team_id='T1' AND channel_id='C1' AND thread_ts='1764168000.000100'"); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.upsertThread("T1", "C1", "backend", "1764168000.000100", "mention", root, []map[string]any{root, reply}, "U-me"); err != nil {
+	if err := service.upsertIntakeItem("T1", "C1", "backend", "1764168000.000100", "1764168000.000100", "mention", root, []map[string]any{root, reply}, "U-me"); err != nil {
 		t.Fatal(err)
 	}
 	var status string
-	if err := store.db.QueryRow("SELECT status FROM slack_threads WHERE slack_team_id='T1' AND channel_id='C1' AND thread_ts='1764168000.000100'").Scan(&status); err != nil {
+	if err := store.db.QueryRow("SELECT status FROM intake_items WHERE slack_team_id='T1' AND channel_id='C1' AND thread_ts='1764168000.000100'").Scan(&status); err != nil {
 		t.Fatal(err)
 	}
-	if status != "no_action" {
+	if status != "resolved" {
 		t.Fatalf("same Slack activity should not recollect terminal thread, got %q", status)
 	}
 
 	newReply := map[string]any{"ts": "1764168120.000300", "thread_ts": "1764168000.000100", "text": "New reply"}
-	if err := service.upsertThread("T1", "C1", "backend", "1764168000.000100", "mention", root, []map[string]any{root, reply, newReply}, "U-me"); err != nil {
+	if err := service.upsertIntakeItem("T1", "C1", "backend", "1764168000.000100", "1764168000.000100", "mention", root, []map[string]any{root, reply, newReply}, "U-me"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.db.QueryRow("SELECT status, latest_slack_message_ts FROM slack_threads WHERE slack_team_id='T1' AND channel_id='C1' AND thread_ts='1764168000.000100'").Scan(&status, &latestTS); err != nil {
+	if err := store.db.QueryRow("SELECT status, latest_slack_message_ts FROM intake_items WHERE slack_team_id='T1' AND channel_id='C1' AND thread_ts='1764168000.000100'").Scan(&status, &latestTS); err != nil {
 		t.Fatal(err)
 	}
-	if status != "collected" || latestTS != "1764168120.000300" {
+	if status != "pending" || latestTS != "1764168120.000300" {
 		t.Fatalf("new Slack activity should recollect thread, status=%q latest=%q", status, latestTS)
 	}
 }
@@ -82,18 +80,18 @@ func TestDashboardIntakeIncludesRecollectedThreadWithExistingJob(t *testing.T) {
 	service, store := testService(t)
 	root := map[string]any{"ts": "1764168000.000100", "text": "Root task"}
 	reply := map[string]any{"ts": "1764168060.000200", "thread_ts": "1764168000.000100", "text": "Reply"}
-	if err := service.upsertThread("T1", "C1", "backend", "1764168000.000100", "mention", root, []map[string]any{root, reply}, "U-me"); err != nil {
+	if err := service.upsertIntakeItem("T1", "C1", "backend", "1764168000.000100", "1764168000.000100", "mention", root, []map[string]any{root, reply}, "U-me"); err != nil {
 		t.Fatal(err)
 	}
 	var threadID int64
-	if err := store.db.QueryRow("SELECT id FROM slack_threads").Scan(&threadID); err != nil {
+	if err := store.db.QueryRow("SELECT id FROM intake_items").Scan(&threadID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.Exec("UPDATE slack_threads SET status='job_created' WHERE id=?", threadID); err != nil {
+	if _, err := store.db.Exec("UPDATE intake_items SET status='resolved' WHERE id=?", threadID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.Exec(
-		"INSERT INTO jobs(slack_thread_id, title, status, created_at, updated_at) VALUES (?, 'Old job', 'completed_no_reply', ?, ?)",
+		"INSERT INTO jobs(intake_item_id, title, status, created_at, updated_at) VALUES (?, 'Old job', 'completed_no_reply', ?, ?)",
 		threadID,
 		utcNow(),
 		utcNow(),
@@ -102,7 +100,7 @@ func TestDashboardIntakeIncludesRecollectedThreadWithExistingJob(t *testing.T) {
 	}
 
 	newReply := map[string]any{"ts": "1764168120.000300", "thread_ts": "1764168000.000100", "text": "New reply"}
-	if err := service.upsertThread("T1", "C1", "backend", "1764168000.000100", "mention", root, []map[string]any{root, reply, newReply}, "U-me"); err != nil {
+	if err := service.upsertIntakeItem("T1", "C1", "backend", "1764168000.000100", "1764168000.000100", "mention", root, []map[string]any{root, reply, newReply}, "U-me"); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := store.DashboardSnapshot()
@@ -114,35 +112,79 @@ func TestDashboardIntakeIncludesRecollectedThreadWithExistingJob(t *testing.T) {
 	}
 }
 
+func TestMissingSyncCursorDefaultsToCurrentSlackTimestamp(t *testing.T) {
+	now := time.Date(2026, 6, 30, 12, 34, 56, 789123000, time.UTC)
+
+	cursor := slackCursorOrNow("", now)
+	if cursor != "1782822896.789123" {
+		t.Fatalf("unexpected default cursor %q", cursor)
+	}
+
+	after := slackSearchAfterDate(cursor, 3)
+	if after != "2026-06-27" {
+		t.Fatalf("unexpected search after date: %q", after)
+	}
+
+	oldest := slackOldestFromCursor(cursor, 3)
+	if oldest != "1782563696.789123" {
+		t.Fatalf("unexpected oldest with lookback: %q", oldest)
+	}
+}
+
+func TestSyncBoundsUseCursorWhenLookbackDisabled(t *testing.T) {
+	after := slackSearchAfterDate("1782822896.789123", 0)
+	if after != "2026-06-30" {
+		t.Fatalf("expected cursor date when search lookback disabled, got %q", after)
+	}
+
+	oldest := slackOldestFromCursor("1782822896.789123", 0)
+	if oldest != "1782822896.789123" {
+		t.Fatalf("expected cursor oldest when lookback disabled, got %q", oldest)
+	}
+}
+
+func TestSlackSyncIntervalDefaultsAndUsesConfig(t *testing.T) {
+	service := &Service{}
+	if got := service.slackSyncInterval(); got != 5*time.Minute {
+		t.Fatalf("expected default sync interval 5m, got %s", got)
+	}
+
+	service.cfg.SlackSyncIntervalSeconds = 42
+	if got := service.slackSyncInterval(); got != 42*time.Second {
+		t.Fatalf("expected configured sync interval 42s, got %s", got)
+	}
+}
+
 func TestRelatedJobsForThreadUsesSameChannelMostRecentLimit(t *testing.T) {
 	service, store := testService(t)
 	if _, err := store.db.Exec(`
-		INSERT INTO slack_threads(
-			slack_team_id, channel_id, channel_name, thread_ts, source_type, status,
-			title, last_slack_activity_at
-		) VALUES ('T1', 'D1', 'DM', '1764167000.000100', 'dm', 'collected', 'Trigger', '2026-06-26T10:00:00Z')`); err != nil {
+		INSERT INTO intake_items(
+			slack_team_id, channel_id, channel_name, trigger_ts, thread_ts, source_type, status,
+			title, latest_slack_message_ts
+		) VALUES ('T1', 'D1', 'DM', '1764167000.000100', '1764167000.000100', 'dm', 'pending', 'Trigger', '1764167000.000100')`); err != nil {
 		t.Fatal(err)
 	}
 	var triggerID int64
-	if err := store.db.QueryRow("SELECT id FROM slack_threads WHERE title='Trigger'").Scan(&triggerID); err != nil {
+	if err := store.db.QueryRow("SELECT id FROM intake_items WHERE title='Trigger'").Scan(&triggerID); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 22; i++ {
 		result, err := store.db.Exec(`
-			INSERT INTO slack_threads(
-				slack_team_id, channel_id, channel_name, thread_ts, source_type, status,
-				title, last_slack_activity_at
-			) VALUES ('T1', 'D1', 'DM', ?, 'dm', 'job_created', ?, ?)`,
+			INSERT INTO intake_items(
+				slack_team_id, channel_id, channel_name, trigger_ts, thread_ts, source_type, status,
+				title, latest_slack_message_ts
+			) VALUES ('T1', 'D1', 'DM', ?, ?, 'dm', 'resolved', ?, ?)`,
+			fmt.Sprintf("1764168%03d.000100", i),
 			fmt.Sprintf("1764168%03d.000100", i),
 			fmt.Sprintf("Thread %02d", i),
-			fmt.Sprintf("2026-06-26T10:%02d:00Z", i),
+			fmt.Sprintf("1764168%03d.000100", i),
 		)
 		if err != nil {
 			t.Fatal(err)
 		}
 		threadID, _ := result.LastInsertId()
 		if _, err := store.db.Exec(
-			"INSERT INTO jobs(slack_thread_id, title, status, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?)",
+			"INSERT INTO jobs(intake_item_id, title, status, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?)",
 			threadID,
 			fmt.Sprintf("same-%02d", i),
 			"2026-06-26T09:00:00Z",
@@ -152,16 +194,16 @@ func TestRelatedJobsForThreadUsesSameChannelMostRecentLimit(t *testing.T) {
 		}
 	}
 	result, err := store.db.Exec(`
-		INSERT INTO slack_threads(
-			slack_team_id, channel_id, channel_name, thread_ts, source_type, status,
-			title, last_slack_activity_at
-		) VALUES ('T1', 'D2', 'Other DM', '1764169000.000100', 'dm', 'job_created', 'Other channel', '2026-06-26T11:00:00Z')`)
+		INSERT INTO intake_items(
+			slack_team_id, channel_id, channel_name, trigger_ts, thread_ts, source_type, status,
+			title, latest_slack_message_ts
+		) VALUES ('T1', 'D2', 'Other DM', '1764169000.000100', '1764169000.000100', 'dm', 'resolved', 'Other channel', '1764169000.000100')`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	otherThreadID, _ := result.LastInsertId()
 	if _, err := store.db.Exec(
-		"INSERT INTO jobs(slack_thread_id, title, status, created_at, updated_at) VALUES (?, 'other-channel', 'queued', ?, ?)",
+		"INSERT INTO jobs(intake_item_id, title, status, created_at, updated_at) VALUES (?, 'other-channel', 'queued', ?, ?)",
 		otherThreadID,
 		"2026-06-26T11:00:00Z",
 		"2026-06-26T11:00:00Z",
@@ -189,7 +231,7 @@ func TestRelatedJobsForThreadUsesSameChannelMostRecentLimit(t *testing.T) {
 func TestDashboardSnapshotIncludesRootUserForRepliesAndJobs(t *testing.T) {
 	service, store := testService(t)
 	root := map[string]any{"ts": "1764168000.000100", "text": "Need help", "user": "U1"}
-	if err := service.upsertThread("T1", "C1", "DM", "1764168000.000100", "dm", root, []map[string]any{root}, "U-me"); err != nil {
+	if err := service.upsertIntakeItem("T1", "C1", "DM", "1764168000.000100", "1764168000.000100", "dm", root, []map[string]any{root}, "U-me"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.Exec(`
@@ -200,11 +242,11 @@ func TestDashboardSnapshotIncludesRootUserForRepliesAndJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	var threadID int64
-	if err := store.db.QueryRow("SELECT id FROM slack_threads").Scan(&threadID); err != nil {
+	if err := store.db.QueryRow("SELECT id FROM intake_items").Scan(&threadID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.Exec(
-		"INSERT INTO jobs(slack_thread_id, title, status, created_at, updated_at) VALUES (?, 'Need help', 'draft_ready', ?, ?)",
+		"INSERT INTO jobs(intake_item_id, title, status, created_at, updated_at) VALUES (?, 'Need help', 'draft_ready', ?, ?)",
 		threadID,
 		utcNow(),
 		utcNow(),
@@ -217,7 +259,7 @@ func TestDashboardSnapshotIncludesRootUserForRepliesAndJobs(t *testing.T) {
 	}
 	if _, err := store.db.Exec(`
 		INSERT INTO reply_drafts(
-			job_id, slack_thread_id, status, draft_text, slack_channel_id, slack_thread_ts,
+			job_id, intake_item_id, status, draft_text, slack_channel_id, slack_thread_ts,
 			created_at, updated_at
 		) VALUES (?, ?, 'draft', 'Sure', 'C1', '1764168000.000100', ?, ?)`,
 		jobID,
@@ -235,13 +277,13 @@ func TestDashboardSnapshotIncludesRootUserForRepliesAndJobs(t *testing.T) {
 	if len(snapshot.ReplyDrafts) != 1 {
 		t.Fatalf("expected one reply draft, got %d", len(snapshot.ReplyDrafts))
 	}
-	if got := snapshot.ReplyDrafts[0]["root_user_name"]; got != "Tim Zhou" {
+	if got := snapshot.ReplyDrafts[0]["root_display_name"]; got != "Tim Zhou" {
 		t.Fatalf("reply draft root user = %v, want Tim Zhou", got)
 	}
 	if len(snapshot.Jobs) != 1 {
 		t.Fatalf("expected one job, got %d", len(snapshot.Jobs))
 	}
-	if got := snapshot.Jobs[0]["root_user_name"]; got != "Tim Zhou" {
+	if got := snapshot.Jobs[0]["root_display_name"]; got != "Tim Zhou" {
 		t.Fatalf("job root user = %v, want Tim Zhou", got)
 	}
 }
@@ -249,17 +291,17 @@ func TestDashboardSnapshotIncludesRootUserForRepliesAndJobs(t *testing.T) {
 func TestRetryJobAfterWorkerErrorQueuesJobAndKeepsExecutionLog(t *testing.T) {
 	service, store := testService(t)
 	if _, err := store.db.Exec(`
-		INSERT INTO slack_threads(slack_team_id, channel_id, thread_ts, source_type, status, title)
-		VALUES ('T1', 'C1', '1764168000.000100', 'dm', 'job_created', 'Task')`); err != nil {
+		INSERT INTO intake_items(slack_team_id, channel_id, trigger_ts, thread_ts, source_type, status, title)
+		VALUES ('T1', 'C1', '1764168000.000100', '1764168000.000100', 'dm', 'resolved', 'Task')`); err != nil {
 		t.Fatal(err)
 	}
 	var threadID int64
-	if err := store.db.QueryRow("SELECT id FROM slack_threads").Scan(&threadID); err != nil {
+	if err := store.db.QueryRow("SELECT id FROM intake_items").Scan(&threadID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.Exec(`
 		INSERT INTO jobs(
-			slack_thread_id, title, status, current_block_reason, next_user_action,
+			intake_item_id, title, status, current_block_reason, next_user_action,
 			created_at, updated_at
 		) VALUES (?, 'Task', 'queued', 'turn timed out', 'Review Codex worker failure and retry.', ?, ?)`,
 		threadID,
@@ -305,16 +347,16 @@ func TestQueueJobKeepsStatusQueuedUntilWorkerClaim(t *testing.T) {
 	service.jobs = make(chan int64, 1)
 	service.queuedJobs = map[int64]struct{}{}
 	if _, err := store.db.Exec(`
-		INSERT INTO slack_threads(slack_team_id, channel_id, thread_ts, source_type, status, title)
-		VALUES ('T1', 'C1', '1764168000.000100', 'dm', 'job_created', 'Task')`); err != nil {
+		INSERT INTO intake_items(slack_team_id, channel_id, trigger_ts, thread_ts, source_type, status, title)
+		VALUES ('T1', 'C1', '1764168000.000100', '1764168000.000100', 'dm', 'resolved', 'Task')`); err != nil {
 		t.Fatal(err)
 	}
 	var threadID int64
-	if err := store.db.QueryRow("SELECT id FROM slack_threads").Scan(&threadID); err != nil {
+	if err := store.db.QueryRow("SELECT id FROM intake_items").Scan(&threadID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.Exec(
-		"INSERT INTO jobs(slack_thread_id, title, status, created_at, updated_at) VALUES (?, 'Task', 'queued', ?, ?)",
+		"INSERT INTO jobs(intake_item_id, title, status, created_at, updated_at) VALUES (?, 'Task', 'queued', ?, ?)",
 		threadID,
 		utcNow(),
 		utcNow(),
@@ -363,20 +405,86 @@ func TestQueueJobKeepsStatusQueuedUntilWorkerClaim(t *testing.T) {
 	}
 }
 
+func TestAdvanceIntakeDoesNotLetFullAnalysisQueueBlockJobs(t *testing.T) {
+	service, store := testService(t)
+	service.analyses = make(chan int64, 1)
+	service.jobs = make(chan int64, 1)
+	service.activeAnalyses = map[int64]struct{}{}
+	service.queuedJobs = map[int64]struct{}{}
+	service.workingJobs = map[int64]struct{}{}
+	service.analyses <- 999
+
+	if _, err := store.db.Exec(`
+		INSERT INTO intake_items(slack_team_id, channel_id, trigger_ts, thread_ts, source_type, status, title, latest_slack_message_ts)
+		VALUES ('T1', 'C-analysis', '1764168000.000100', '1764168000.000100', 'dm', 'pending', 'Analysis backlog', '1764168000.000100')`); err != nil {
+		t.Fatal(err)
+	}
+	var analysisThreadID int64
+	if err := store.db.QueryRow("SELECT id FROM intake_items WHERE channel_id='C-analysis'").Scan(&analysisThreadID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.db.Exec(`
+		INSERT INTO intake_items(slack_team_id, channel_id, trigger_ts, thread_ts, source_type, status, title)
+		VALUES ('T1', 'C-job', '1764168060.000200', '1764168060.000200', 'dm', 'resolved', 'Worker task')`); err != nil {
+		t.Fatal(err)
+	}
+	var jobThreadID int64
+	if err := store.db.QueryRow("SELECT id FROM intake_items WHERE channel_id='C-job'").Scan(&jobThreadID); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.db.Exec(
+		"INSERT INTO jobs(intake_item_id, title, status, created_at, updated_at) VALUES (?, 'Worker task', 'queued', ?, ?)",
+		jobThreadID,
+		utcNow(),
+		utcNow(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		service.advanceIntake()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("advanceIntake blocked behind a full analysis queue")
+	}
+	select {
+	case got := <-service.jobs:
+		if got != jobID {
+			t.Fatalf("queued job id = %d, want %d", got, jobID)
+		}
+	default:
+		t.Fatal("expected queued job to be enqueued despite full analysis queue")
+	}
+	if _, exists := service.activeAnalyses[analysisThreadID]; exists {
+		t.Fatal("full analysis queue should not mark the thread as queued in memory")
+	}
+}
+
 func TestRecoverInterruptedJobsRequeuesObsoleteInFlightStates(t *testing.T) {
 	service, store := testService(t)
 	if _, err := store.db.Exec(`
-		INSERT INTO slack_threads(slack_team_id, channel_id, thread_ts, source_type, status, title)
-		VALUES ('T1', 'C1', '1764168000.000100', 'dm', 'job_created', 'Task')`); err != nil {
+		INSERT INTO intake_items(slack_team_id, channel_id, trigger_ts, thread_ts, source_type, status, title)
+		VALUES ('T1', 'C1', '1764168000.000100', '1764168000.000100', 'dm', 'resolved', 'Task')`); err != nil {
 		t.Fatal(err)
 	}
 	var threadID int64
-	if err := store.db.QueryRow("SELECT id FROM slack_threads").Scan(&threadID); err != nil {
+	if err := store.db.QueryRow("SELECT id FROM intake_items").Scan(&threadID); err != nil {
 		t.Fatal(err)
 	}
 	for _, status := range []string{"workspace_creating", "bootstrapping", "working", "draft_ready"} {
 		if _, err := store.db.Exec(
-			"INSERT INTO jobs(slack_thread_id, title, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+			"INSERT INTO jobs(intake_item_id, title, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
 			threadID,
 			status,
 			status,
@@ -425,17 +533,17 @@ func TestRecoverInterruptedJobsRequeuesObsoleteInFlightStates(t *testing.T) {
 func TestDashboardSnapshotUsesInMemoryWorkingJobs(t *testing.T) {
 	service, store := testService(t)
 	if _, err := store.db.Exec(`
-		INSERT INTO slack_threads(slack_team_id, channel_id, thread_ts, source_type, status, title)
-		VALUES ('T1', 'C1', '1764168000.000100', 'dm', 'job_created', 'Task')`); err != nil {
+		INSERT INTO intake_items(slack_team_id, channel_id, trigger_ts, thread_ts, source_type, status, title)
+		VALUES ('T1', 'C1', '1764168000.000100', '1764168000.000100', 'dm', 'resolved', 'Task')`); err != nil {
 		t.Fatal(err)
 	}
 	var threadID int64
-	if err := store.db.QueryRow("SELECT id FROM slack_threads").Scan(&threadID); err != nil {
+	if err := store.db.QueryRow("SELECT id FROM intake_items").Scan(&threadID); err != nil {
 		t.Fatal(err)
 	}
 	for _, title := range []string{"Active task", "Queued task"} {
 		if _, err := store.db.Exec(
-			"INSERT INTO jobs(slack_thread_id, title, status, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?)",
+			"INSERT INTO jobs(intake_item_id, title, status, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?)",
 			threadID,
 			title,
 			utcNow(),
@@ -469,12 +577,12 @@ func TestEnsureJobWorkspaceSkipsBootstrapWhenAlreadySucceeded(t *testing.T) {
 	service, store := testService(t)
 	service.cfg.WorkspaceBootstrapCommand = "touch should_not_exist"
 	if _, err := store.db.Exec(`
-		INSERT INTO slack_threads(slack_team_id, channel_id, thread_ts, source_type, status, title)
-		VALUES ('T1', 'C1', '1764168000.000100', 'dm', 'job_created', 'Task')`); err != nil {
+		INSERT INTO intake_items(slack_team_id, channel_id, trigger_ts, thread_ts, source_type, status, title)
+		VALUES ('T1', 'C1', '1764168000.000100', '1764168000.000100', 'dm', 'resolved', 'Task')`); err != nil {
 		t.Fatal(err)
 	}
 	var threadID int64
-	if err := store.db.QueryRow("SELECT id FROM slack_threads").Scan(&threadID); err != nil {
+	if err := store.db.QueryRow("SELECT id FROM intake_items").Scan(&threadID); err != nil {
 		t.Fatal(err)
 	}
 	workspace := filepath.Join(service.cfg.WorkspaceRoot, "job-1")
@@ -483,7 +591,7 @@ func TestEnsureJobWorkspaceSkipsBootstrapWhenAlreadySucceeded(t *testing.T) {
 	}
 	if _, err := store.db.Exec(
 		`INSERT INTO jobs(
-			slack_thread_id, title, status, workspace_path, bootstrap_status, created_at, updated_at
+			intake_item_id, title, status, workspace_path, bootstrap_status, created_at, updated_at
 		) VALUES (?, 'Task', 'queued', ?, 'succeeded', ?, ?)`,
 		threadID,
 		workspace,
@@ -519,7 +627,7 @@ func TestEnsureJobWorkspaceSkipsBootstrapWhenAlreadySucceeded(t *testing.T) {
 func TestJobWorkspaceFallsBackToSlackThreadWorkspace(t *testing.T) {
 	service, _ := testService(t)
 
-	workspace := service.jobWorkspace(7, map[string]any{"slack_thread_id": int64(42)})
+	workspace := service.jobWorkspace(7, map[string]any{"intake_item_id": int64(42)})
 	want := service.threadWorkspace(42)
 	if workspace != want {
 		t.Fatalf("job workspace = %q, want %q", workspace, want)
@@ -531,8 +639,8 @@ func TestJobWorkspacePrefersPersistedWorkspacePath(t *testing.T) {
 	persisted := filepath.Join(service.cfg.WorkspaceRoot, "custom")
 
 	workspace := service.jobWorkspace(7, map[string]any{
-		"slack_thread_id": int64(42),
-		"workspace_path":  persisted,
+		"intake_item_id": int64(42),
+		"workspace_path": persisted,
 	})
 	if workspace != persisted {
 		t.Fatalf("job workspace = %q, want persisted path %q", workspace, persisted)
@@ -555,15 +663,15 @@ func TestEnsureAnalyzerWorkspaceRunsBootstrap(t *testing.T) {
 func TestFinishAnalysisErrorKeepsThreadQueuedForRetry(t *testing.T) {
 	service, store := testService(t)
 	if _, err := store.db.Exec(`
-		INSERT INTO slack_threads(slack_team_id, channel_id, thread_ts, source_type, status, title)
-		VALUES ('T1', 'C1', '1764168000.000100', 'dm', 'analyzing', 'Task')`); err != nil {
+		INSERT INTO intake_items(slack_team_id, channel_id, trigger_ts, thread_ts, source_type, status, title)
+		VALUES ('T1', 'C1', '1764168000.000100', '1764168000.000100', 'dm', 'pending', 'Task')`); err != nil {
 		t.Fatal(err)
 	}
 	var threadID int64
-	if err := store.db.QueryRow("SELECT id FROM slack_threads").Scan(&threadID); err != nil {
+	if err := store.db.QueryRow("SELECT id FROM intake_items").Scan(&threadID); err != nil {
 		t.Fatal(err)
 	}
-	result, err := store.db.Exec("INSERT INTO analysis_runs(slack_thread_id, status, started_at) VALUES (?, 'running', ?)", threadID, utcNow())
+	result, err := store.db.Exec("INSERT INTO analysis_runs(intake_item_id, status, started_at) VALUES (?, 'running', ?)", threadID, utcNow())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -575,18 +683,102 @@ func TestFinishAnalysisErrorKeepsThreadQueuedForRetry(t *testing.T) {
 	service.finishAnalysisError(threadID, analysisID, errors.New("thread/start failed"))
 
 	var threadStatus, runStatus, runError string
-	if err := store.db.QueryRow("SELECT status FROM slack_threads WHERE id=?", threadID).Scan(&threadStatus); err != nil {
+	if err := store.db.QueryRow("SELECT status FROM intake_items WHERE id=?", threadID).Scan(&threadStatus); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.db.QueryRow("SELECT status, error FROM analysis_runs WHERE id=?", analysisID).Scan(&runStatus, &runError); err != nil {
 		t.Fatal(err)
 	}
-	if threadStatus != "analysis_queued" || runStatus != "failed" || runError != "thread/start failed" {
+	if threadStatus != "pending" || runStatus != "failed" || runError != "thread/start failed" {
 		t.Fatalf("unexpected analysis retry state: thread=%q run=%q error=%q", threadStatus, runStatus, runError)
 	}
 }
 
-func TestMigrateAddsSlackThreadTimestampColumnsToExistingDatabase(t *testing.T) {
+func TestWorkerSessionStoresCodexSessionID(t *testing.T) {
+	service, store := testService(t)
+	if _, err := store.db.Exec(`
+		INSERT INTO intake_items(slack_team_id, channel_id, trigger_ts, thread_ts, source_type, status, title)
+		VALUES ('T1', 'C1', '1764168000.000100', '1764168000.000100', 'dm', 'resolved', 'Task')`); err != nil {
+		t.Fatal(err)
+	}
+	var threadID int64
+	if err := store.db.QueryRow("SELECT id FROM intake_items").Scan(&threadID); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.db.Exec(
+		"INSERT INTO jobs(intake_item_id, title, status, created_at, updated_at) VALUES (?, 'Task', 'queued', ?, ?)",
+		threadID,
+		utcNow(),
+		utcNow(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sessionID := service.startWorkerSession(jobID, CodexThreadRef{ThreadID: "thread-1", SessionID: "session-1"})
+	service.finishWorkerSession(sessionID, "completed", "")
+
+	var threadRef, sessionRef, status string
+	if err := store.db.QueryRow(
+		"SELECT codex_thread_id, codex_session_id, status FROM worker_sessions WHERE id=?",
+		sessionID,
+	).Scan(&threadRef, &sessionRef, &status); err != nil {
+		t.Fatal(err)
+	}
+	if threadRef != "thread-1" || sessionRef != "session-1" || status != "completed" {
+		t.Fatalf("unexpected worker session: thread=%q session=%q status=%q", threadRef, sessionRef, status)
+	}
+}
+
+func TestRecoverInterruptedWorkerSessionsMarksRunningFailed(t *testing.T) {
+	service, store := testService(t)
+	if _, err := store.db.Exec(`
+		INSERT INTO intake_items(slack_team_id, channel_id, trigger_ts, thread_ts, source_type, status, title)
+		VALUES ('T1', 'C1', '1764168000.000100', '1764168000.000100', 'dm', 'resolved', 'Task')`); err != nil {
+		t.Fatal(err)
+	}
+	var threadID int64
+	if err := store.db.QueryRow("SELECT id FROM intake_items").Scan(&threadID); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.db.Exec(
+		"INSERT INTO jobs(intake_item_id, title, status, created_at, updated_at) VALUES (?, 'Task', 'queued', ?, ?)",
+		threadID,
+		utcNow(),
+		utcNow(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(
+		`INSERT INTO worker_sessions(job_id, codex_thread_id, codex_session_id, status, started_at)
+		 VALUES (?, 'thread-1', 'session-1', 'running', ?)`,
+		jobID,
+		utcNow(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	service.recoverInterruptedWorkerSessions()
+
+	var status, sessionErr string
+	if err := store.db.QueryRow("SELECT status, error FROM worker_sessions WHERE job_id=?", jobID).Scan(&status, &sessionErr); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" || sessionErr != "Worker session interrupted before completion." {
+		t.Fatalf("unexpected recovered session: status=%q error=%q", status, sessionErr)
+	}
+}
+
+func TestMigrateResetsLegacySlackThreadSchema(t *testing.T) {
 	cfg := Config{DatabasePath: filepath.Join(t.TempDir(), "slack_agent.db")}
 	store, err := OpenStore(cfg)
 	if err != nil {
@@ -594,87 +786,163 @@ func TestMigrateAddsSlackThreadTimestampColumnsToExistingDatabase(t *testing.T) 
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	if _, err := store.db.Exec(`
-		CREATE TABLE slack_threads (
-		  id INTEGER PRIMARY KEY AUTOINCREMENT,
-		  slack_team_id TEXT NOT NULL,
-		  channel_id TEXT NOT NULL,
-		  channel_name TEXT,
-		  thread_ts TEXT NOT NULL,
-		  root_message_ts TEXT,
-		  source_type TEXT NOT NULL,
-		  status TEXT NOT NULL,
-		  title TEXT,
-		  permalink TEXT,
-		  last_slack_activity_at TEXT,
-		  last_synced_at TEXT,
-		  raw_json TEXT,
-		  UNIQUE(slack_team_id, channel_id, thread_ts)
-		)`,
+CREATE TABLE metadata (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+INSERT INTO metadata(key, value) VALUES ('slack_sync.search.mention.latest_ts', '9999999999.000000');
+CREATE TABLE slack_threads (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slack_team_id TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  channel_name TEXT,
+  thread_ts TEXT NOT NULL,
+  root_message_ts TEXT,
+  source_type TEXT NOT NULL,
+  status TEXT NOT NULL,
+  title TEXT,
+  permalink TEXT,
+  last_slack_activity_at TEXT,
+  last_synced_at TEXT,
+  raw_json TEXT,
+  UNIQUE(slack_team_id, channel_id, thread_ts)
+);
+INSERT INTO slack_threads(slack_team_id, channel_id, thread_ts, source_type, status, title)
+VALUES ('T1', 'C1', '1764168000.000100', 'mention', 'collected', 'legacy');
+CREATE TABLE analysis_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slack_thread_id INTEGER NOT NULL REFERENCES slack_threads(id) ON DELETE CASCADE,
+  codex_thread_id TEXT,
+  status TEXT NOT NULL,
+  action_required INTEGER,
+  confidence REAL,
+  summary TEXT,
+  rationale TEXT,
+  structured_result_json TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  error TEXT
+);
+CREATE TABLE jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slack_thread_id INTEGER NOT NULL REFERENCES slack_threads(id) ON DELETE CASCADE,
+  analysis_run_id INTEGER REFERENCES analysis_runs(id) ON DELETE SET NULL,
+  title TEXT NOT NULL,
+  status TEXT NOT NULL,
+  urgency TEXT,
+  task_type TEXT,
+  workspace_path TEXT,
+  bootstrap_status TEXT,
+  codex_thread_id TEXT,
+  current_block_reason TEXT,
+  next_user_action TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE worker_sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  codex_thread_id TEXT,
+  status TEXT NOT NULL,
+  started_at TEXT,
+  completed_at TEXT,
+  error TEXT
+)`,
 	); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Migrate(); err != nil {
 		t.Fatal(err)
 	}
-	columns := map[string]bool{}
-	rows, err := store.db.Query("PRAGMA table_info(slack_threads)")
-	if err != nil {
+
+	if exists, err := store.tableExists("slack_threads"); err != nil {
+		t.Fatal(err)
+	} else if exists {
+		t.Fatal("legacy slack_threads table should be dropped")
+	}
+	if exists, err := store.tableExists("intake_items"); err != nil {
+		t.Fatal(err)
+	} else if !exists {
+		t.Fatal("expected intake_items table")
+	}
+	var count int
+	if err := store.db.QueryRow("SELECT COUNT(*) FROM intake_items").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var cid int
-		var name, dataType string
-		var notNull int
-		var defaultValue any
-		var pk int
-		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk); err != nil {
+	if count != 0 {
+		t.Fatalf("legacy intake cache should be reset, got %d rows", count)
+	}
+	var cursorCount int
+	if err := store.db.QueryRow("SELECT COUNT(*) FROM metadata WHERE key LIKE 'slack_sync.%'").Scan(&cursorCount); err != nil {
+		t.Fatal(err)
+	}
+	if cursorCount != 0 {
+		t.Fatalf("legacy Slack cursors should be reset, got %d", cursorCount)
+	}
+
+	tableColumns := func(table string) map[string]bool {
+		t.Helper()
+		columns := map[string]bool{}
+		rows, err := store.db.Query("PRAGMA table_info(" + table + ")")
+		if err != nil {
 			t.Fatal(err)
 		}
-		columns[name] = true
+		defer rows.Close()
+		for rows.Next() {
+			var cid int
+			var name, dataType string
+			var notNull int
+			var defaultValue any
+			var pk int
+			if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk); err != nil {
+				t.Fatal(err)
+			}
+			columns[name] = true
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return columns
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	for _, column := range []string{"latest_slack_message_ts", "last_analyzed_slack_ts"} {
-		if !columns[column] {
-			t.Fatalf("expected migrated column %q", column)
+	assertColumns := func(table string, expected []string) {
+		t.Helper()
+		columns := tableColumns(table)
+		for _, column := range expected {
+			if !columns[column] {
+				t.Fatalf("expected migrated column %s.%s", table, column)
+			}
 		}
 	}
-}
-
-func TestBackfillSlackThreadActivityUsesLatestSlackMessageTS(t *testing.T) {
-	_, store := testService(t)
-	if _, err := store.db.Exec(`
-		INSERT INTO slack_threads(
-			slack_team_id, channel_id, thread_ts, source_type, status,
-			title, last_slack_activity_at, last_synced_at
-		) VALUES ('T1', 'C1', '1764168000.000100', 'mention', 'collected', 'Root', '2026-06-26T10:22:33Z', '2026-06-26T10:22:33Z')`); err != nil {
-		t.Fatal(err)
+	assertMissingColumns := func(table string, expected []string) {
+		t.Helper()
+		columns := tableColumns(table)
+		for _, column := range expected {
+			if columns[column] {
+				t.Fatalf("expected migrated column %s.%s to be removed", table, column)
+			}
+		}
 	}
-	var threadID int64
-	if err := store.db.QueryRow("SELECT id FROM slack_threads").Scan(&threadID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.db.Exec(`
-		INSERT INTO slack_messages(slack_thread_id, slack_message_ts, user_id, text)
-		VALUES (?, '1764168000.000100', 'U1', 'Root'),
-		       (?, '1764168120.000300', 'U2', 'Latest reply')`,
-		threadID,
-		threadID,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.backfillSlackThreadActivity(); err != nil {
-		t.Fatal(err)
-	}
-	var latestTS, activityAt string
-	if err := store.db.QueryRow("SELECT latest_slack_message_ts, last_slack_activity_at FROM slack_threads WHERE id=?", threadID).Scan(&latestTS, &activityAt); err != nil {
-		t.Fatal(err)
-	}
-	if latestTS != "1764168120.000300" || activityAt != "2025-11-26T14:42:00Z" {
-		t.Fatalf("expected latest Slack activity, latest=%q activity=%q", latestTS, activityAt)
-	}
+	assertColumns("intake_items", []string{
+		"trigger_ts",
+		"trigger_user_id",
+		"trigger_text",
+		"resolution",
+		"latest_slack_message_ts",
+		"latest_user_id",
+		"latest_user_name",
+		"latest_text",
+		"last_analyzed_slack_ts",
+	})
+	assertMissingColumns("intake_items", []string{
+		"root_message_ts",
+		"root_user_name",
+		"last_slack_activity_at",
+		"message_count",
+		"mentions_user",
+	})
+	assertColumns("analysis_runs", []string{"codex_session_id"})
+	assertColumns("jobs", []string{"codex_session_id"})
+	assertColumns("worker_sessions", []string{"codex_session_id"})
 }
 
 func TestExtractReplyRequiresLineStartMarkerAndRejectsProcessNotes(t *testing.T) {
@@ -725,16 +993,16 @@ SLACK_REPLY_DRAFT: NONE`)
 func TestFinishJobFromWorkerOutputBlocksJobAndKeepsThreadOpen(t *testing.T) {
 	service, store := testService(t)
 	if _, err := store.db.Exec(`
-		INSERT INTO slack_threads(slack_team_id, channel_id, thread_ts, source_type, status, title)
-		VALUES ('T1', 'C1', '1764168000.000100', 'mention', 'job_created', 'Task')`); err != nil {
+		INSERT INTO intake_items(slack_team_id, channel_id, trigger_ts, thread_ts, source_type, status, title)
+		VALUES ('T1', 'C1', '1764168000.000100', '1764168000.000100', 'mention', 'resolved', 'Task')`); err != nil {
 		t.Fatal(err)
 	}
 	var threadID int64
-	if err := store.db.QueryRow("SELECT id FROM slack_threads").Scan(&threadID); err != nil {
+	if err := store.db.QueryRow("SELECT id FROM intake_items").Scan(&threadID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.Exec(
-		"INSERT INTO jobs(slack_thread_id, title, status, created_at, updated_at) VALUES (?, 'Task', 'queued', ?, ?)",
+		"INSERT INTO jobs(intake_item_id, title, status, created_at, updated_at) VALUES (?, 'Task', 'queued', ?, ?)",
 		threadID,
 		utcNow(),
 		utcNow(),
@@ -759,13 +1027,13 @@ SLACK_REPLY_DRAFT: NONE`)
 	if err := store.db.QueryRow("SELECT status, current_block_reason, next_user_action FROM jobs WHERE id=?", jobID).Scan(&jobStatus, &reason, &nextAction); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.db.QueryRow("SELECT status FROM slack_threads WHERE id=?", threadID).Scan(&threadStatus); err != nil {
+	if err := store.db.QueryRow("SELECT status FROM intake_items WHERE id=?", threadID).Scan(&threadStatus); err != nil {
 		t.Fatal(err)
 	}
 	if jobStatus != "blocked" || reason != "Need a production request ID." || nextAction != "Send the failed request ID." {
 		t.Fatalf("unexpected job state: status=%q reason=%q next=%q", jobStatus, reason, nextAction)
 	}
-	if threadStatus != "job_created" {
+	if threadStatus != "resolved" {
 		t.Fatalf("blocked worker output should not archive thread, got %q", threadStatus)
 	}
 	var replyCount int
@@ -787,16 +1055,16 @@ SLACK_REPLY_DRAFT: NONE`)
 func TestArchiveReplyIgnoresDraftAndArchivesThread(t *testing.T) {
 	_, store := testService(t)
 	if _, err := store.db.Exec(`
-		INSERT INTO slack_threads(slack_team_id, channel_id, thread_ts, source_type, status, title)
-		VALUES ('T1', 'C1', '1764168000.000100', 'mention', 'job_created', 'Task')`); err != nil {
+		INSERT INTO intake_items(slack_team_id, channel_id, trigger_ts, thread_ts, source_type, status, title)
+		VALUES ('T1', 'C1', '1764168000.000100', '1764168000.000100', 'mention', 'resolved', 'Task')`); err != nil {
 		t.Fatal(err)
 	}
 	var threadID int64
-	if err := store.db.QueryRow("SELECT id FROM slack_threads").Scan(&threadID); err != nil {
+	if err := store.db.QueryRow("SELECT id FROM intake_items").Scan(&threadID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.Exec(
-		"INSERT INTO jobs(slack_thread_id, title, status, created_at, updated_at) VALUES (?, 'Task', 'draft_ready', ?, ?)",
+		"INSERT INTO jobs(intake_item_id, title, status, created_at, updated_at) VALUES (?, 'Task', 'draft_ready', ?, ?)",
 		threadID,
 		utcNow(),
 		utcNow(),
@@ -809,7 +1077,7 @@ func TestArchiveReplyIgnoresDraftAndArchivesThread(t *testing.T) {
 	}
 	if _, err := store.db.Exec(`
 		INSERT INTO reply_drafts(
-			job_id, slack_thread_id, status, draft_text, slack_channel_id, slack_thread_ts,
+			job_id, intake_item_id, status, draft_text, slack_channel_id, slack_thread_ts,
 			created_at, updated_at
 		) VALUES (?, ?, 'draft', 'Thanks', 'C1', '1764168000.000100', ?, ?)`,
 		jobID,
@@ -831,13 +1099,13 @@ func TestArchiveReplyIgnoresDraftAndArchivesThread(t *testing.T) {
 	if err := store.db.QueryRow("SELECT status FROM reply_drafts WHERE id=?", replyID).Scan(&replyStatus); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.db.QueryRow("SELECT status FROM slack_threads WHERE id=?", threadID).Scan(&threadStatus); err != nil {
+	if err := store.db.QueryRow("SELECT status FROM intake_items WHERE id=?", threadID).Scan(&threadStatus); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.db.QueryRow("SELECT status FROM jobs WHERE id=?", jobID).Scan(&jobStatus); err != nil {
 		t.Fatal(err)
 	}
-	if replyStatus != "ignored" || threadStatus != "archived" || jobStatus != "completed_no_reply" {
+	if replyStatus != "ignored" || threadStatus != "resolved" || jobStatus != "completed_no_reply" {
 		t.Fatalf("unexpected statuses: reply=%q thread=%q job=%q", replyStatus, threadStatus, jobStatus)
 	}
 }
@@ -845,17 +1113,17 @@ func TestArchiveReplyIgnoresDraftAndArchivesThread(t *testing.T) {
 func TestSendReplyRejectsProcessNoteDraft(t *testing.T) {
 	_, store := testService(t)
 	if _, err := store.db.Exec(`
-		INSERT INTO slack_threads(slack_team_id, channel_id, thread_ts, source_type, status, title)
-		VALUES ('T1', 'C1', '1764168000.000100', 'dm', 'job_created', 'AWS reset')`); err != nil {
+		INSERT INTO intake_items(slack_team_id, channel_id, trigger_ts, thread_ts, source_type, status, title)
+		VALUES ('T1', 'C1', '1764168000.000100', '1764168000.000100', 'dm', 'resolved', 'AWS reset')`); err != nil {
 		t.Fatal(err)
 	}
 	var threadID int64
-	if err := store.db.QueryRow("SELECT id FROM slack_threads").Scan(&threadID); err != nil {
+	if err := store.db.QueryRow("SELECT id FROM intake_items").Scan(&threadID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.Exec(`
 		INSERT INTO reply_drafts(
-			slack_thread_id, status, draft_text, slack_channel_id, slack_thread_ts,
+			intake_item_id, status, draft_text, slack_channel_id, slack_thread_ts,
 			created_at, updated_at
 		) VALUES (?, 'draft', ?, 'C1', '1764168000.000100', ?, ?)`,
 		threadID,

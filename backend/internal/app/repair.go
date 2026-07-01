@@ -103,10 +103,11 @@ func (s *Store) RepairAnalysisStructuredOutputs() (AnalysisRepairResult, error) 
 			  AND (
 			    title=''
 			    OR title LIKE 'Slack thread %'
+			    OR title LIKE 'Intake item %'
 			    OR EXISTS (
 			      SELECT 1
-			      FROM slack_threads st
-			      WHERE st.id=jobs.slack_thread_id
+			      FROM intake_items st
+			      WHERE st.id=jobs.intake_item_id
 			        AND jobs.title=st.title
 			    )
 			  )`,

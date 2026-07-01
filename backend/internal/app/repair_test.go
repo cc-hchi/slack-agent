@@ -6,9 +6,9 @@ func TestRepairAnalysisStructuredOutputsBackfillsLegacyRuns(t *testing.T) {
 	_, store := testService(t)
 	now := utcNow()
 	if _, err := store.db.Exec(`
-		INSERT INTO slack_threads(
-			slack_team_id, channel_id, thread_ts, source_type, status, title
-		) VALUES ('T1', 'D1', '1782114253.555859', 'dm', 'job_created', '这个是不是也要的 ↑')`); err != nil {
+		INSERT INTO intake_items(
+			slack_team_id, channel_id, trigger_ts, thread_ts, source_type, status, title
+		) VALUES ('T1', 'D1', '1782114253.555859', '1782114253.555859', 'dm', 'resolved', '这个是不是也要的 ↑')`); err != nil {
 		t.Fatal(err)
 	}
 	raw := `I will inspect context first.action_required: yes
@@ -26,7 +26,7 @@ worker_plan: Inspect surrounding DM messages and draft a reply.
 needed_user_confirmation: Confirm before sending.`
 	if _, err := store.db.Exec(`
 		INSERT INTO analysis_runs(
-			slack_thread_id, status, action_required, confidence, summary, rationale,
+			intake_item_id, status, action_required, confidence, summary, rationale,
 			structured_result_json, started_at, completed_at
 		) VALUES (1, 'completed', 1, 0.7, ?, ?, ?, ?, ?)`,
 		raw,
@@ -44,7 +44,7 @@ needed_user_confirmation: Confirm before sending.`
 	}
 	if _, err := store.db.Exec(`
 		INSERT INTO jobs(
-			slack_thread_id, analysis_run_id, title, status, urgency, task_type, created_at, updated_at
+			intake_item_id, analysis_run_id, title, status, urgency, task_type, created_at, updated_at
 		) VALUES (1, 1, '这个是不是也要的 ↑', 'queued', 'medium', 'slack_task', ?, ?)`,
 		now,
 		now,

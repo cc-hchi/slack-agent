@@ -2,7 +2,7 @@
 
 ## Goal
 
-Build a personal local Slack work agent that watches Slack threads involving the
+Build a personal local Slack work agent that watches Slack triggers involving the
 user, extracts actionable work, tries to move that work forward with Codex, and
 prepares Slack reply drafts for human review.
 
@@ -72,15 +72,15 @@ Slack reply drafts.
 
 ## Primary Workflow
 
-1. Collector discovers a Slack thread or DM involving the user.
-2. Analyzer creates a dedicated Slack-thread workspace, runs
+1. Collector discovers a Slack trigger from a mention or DM.
+2. Analyzer creates a dedicated intake workspace, runs
    `install-chi-skills`, and opens a dedicated Codex session for that Slack
    context.
-3. Analyzer decides whether the thread needs user action.
+3. Analyzer decides whether the intake needs user action.
 4. If no action is needed, the system records the reason and archives the item.
 5. If action is needed, the system creates a job linked to the analyzer
    workspace.
-6. Worker reuses the Slack-thread workspace and opens a dedicated Codex session
+6. Worker reuses the intake workspace and opens a dedicated Codex session
    to advance the job.
 7. Worker records progress, artifacts, errors, and final outcome.
 8. If a Slack reply is useful, worker creates a draft.

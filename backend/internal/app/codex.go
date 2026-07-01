@@ -30,6 +30,11 @@ type CodexTurnResult struct {
 	Error     string           `json:"error,omitempty"`
 }
 
+type CodexThreadRef struct {
+	ThreadID  string
+	SessionID string
+}
+
 type CodexThreadOptions struct {
 	CWD               string
 	PermissionProfile string
@@ -98,23 +103,34 @@ func (c *CodexClient) Initialize() (map[string]any, error) {
 	return result, nil
 }
 
-func (c *CodexClient) StartThread(options CodexThreadOptions) (string, error) {
+func (c *CodexClient) StartThread(options CodexThreadOptions) (CodexThreadRef, error) {
 	result, err := c.Request("thread/start", options.params(), 20*time.Second)
 	if err != nil {
-		return "", err
+		return CodexThreadRef{}, err
 	}
+	return codexThreadRefFromStartResult(result)
+}
+
+func codexThreadRefFromStartResult(result map[string]any) (CodexThreadRef, error) {
 	thread, _ := result["thread"].(map[string]any)
 	threadID, _ := thread["id"].(string)
 	if threadID == "" {
 		threadID, _ = result["threadId"].(string)
 	}
-	if threadID == "" {
-		threadID, _ = result["sessionId"].(string)
+	sessionID, _ := thread["sessionId"].(string)
+	if sessionID == "" {
+		sessionID, _ = result["sessionId"].(string)
 	}
 	if threadID == "" {
-		return "", fmt.Errorf("thread/start returned no thread id")
+		threadID = sessionID
 	}
-	return threadID, nil
+	if sessionID == "" {
+		sessionID = threadID
+	}
+	if threadID == "" {
+		return CodexThreadRef{}, fmt.Errorf("thread/start returned no thread id")
+	}
+	return CodexThreadRef{ThreadID: threadID, SessionID: sessionID}, nil
 }
 
 func (o CodexThreadOptions) params() map[string]any {
